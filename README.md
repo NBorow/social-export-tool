@@ -24,9 +24,10 @@ The app checks for ffmpeg at startup and strongly recommends installing it. With
 
 ## Installation
 ```sh
-git clone <your-repo-url>
+git clone https://github.com/NBorow/social-export-tool.git
 # Repo name uses hyphen, Python entry script uses underscore
-cd social_export_tool
+cd social-export-tool 
+
 # If you keep a requirements.txt, use it; otherwise install packages from the command above.
 ```
 
