@@ -68,6 +68,74 @@ def sleep_with_cancel(seconds: float) -> bool:
 		SHUTDOWN.wait(min(remaining, 0.5))  # short slices keep UI responsive
 	return SHUTDOWN.is_set()
 
+def wait_with_progress(label: str, seconds: float, *, win_enter_skip: bool = False) -> bool:
+	"""
+	Cancellable sleep that renders a transient wait bar; returns True if shutdown was requested.
+	On Windows, if win_enter_skip is True, pressing Enter skips the wait.
+	"""
+	if seconds <= 0:
+		return SHUTDOWN.is_set()
+	total = float(seconds)
+	start = time.time()
+	width = shutil.get_terminal_size((100, 20)).columns
+	had_sticky = PROGRESS.active
+	skipped = False
+	while not SHUTDOWN.is_set():
+		elapsed = time.time() - start
+		remaining = total - elapsed
+		if remaining <= 0:
+			break
+		bar = PROGRESS._bar(elapsed, total)
+		line = f"[Wait] {label} {PROGRESS._fmt_elapsed(elapsed)}/{PROGRESS._fmt_elapsed(total)} {bar}"
+		line = line[:width - 1]
+		if had_sticky:
+			sticky_line = PROGRESS.render_line()
+			# Save cursor at sticky, draw wait above, redraw sticky, restore cursor to sticky
+			sys.stdout.write("\x1b[s")  # save
+			sys.stdout.write("\x1b[1A\r" + line.ljust(width - 1))  # up to wait, write
+			sys.stdout.write("\x1b[1B\r" + sticky_line)  # down to sticky, write
+			sys.stdout.write("\x1b[u")  # restore to sticky
+			sys.stdout.flush()
+		else:
+			print("\r" + line.ljust(width - 1), end='', flush=True)
+		# allow skip on Windows if requested
+		if win_enter_skip and os.name == 'nt':
+			try:
+				import msvcrt
+				if msvcrt.kbhit():
+					key = msvcrt.getch()
+					if key in (b'\r', b'\n'):
+						skipped = True
+						break
+			except Exception:
+				pass
+		# sleep in short slices to stay responsive
+		SHUTDOWN.wait(min(0.5, max(0.0, remaining)))
+	actual_elapsed = time.time() - start
+	if had_sticky:
+		sticky_line = PROGRESS.render_line()
+		sys.stdout.write("\x1b[s")  # save at sticky
+		# move to wait line, write final message, back to sticky and redraw sticky
+		elapsed_fmt = PROGRESS._fmt_elapsed(actual_elapsed)
+		total_fmt = PROGRESS._fmt_elapsed(total)
+		if skipped:
+			msg = f"[Wait] Skipped at {elapsed_fmt}/{total_fmt}"
+		else:
+			msg = f"[Wait] {elapsed_fmt} completed"
+		msg = msg[:width - 1].ljust(width - 1)
+		sys.stdout.write("\x1b[1A\r" + msg)
+		sys.stdout.write("\x1b[1B\r" + sticky_line)
+		sys.stdout.write("\x1b[u")  # restore cursor to sticky line
+		sys.stdout.flush()
+	else:
+		elapsed_fmt = PROGRESS._fmt_elapsed(actual_elapsed)
+		total_fmt = PROGRESS._fmt_elapsed(total)
+		if skipped:
+			print(f"\r[Wait] Skipped at {elapsed_fmt}/{total_fmt}")
+		else:
+			print(f"\r[Wait] {elapsed_fmt} completed")
+	return SHUTDOWN.is_set()
+
 def posix_sleep_with_optional_enter(seconds: float, msg: str) -> bool:
 	"""
 	POSIX-only: sleep up to `seconds`, but if stdin is a TTY, allow Enter to skip.
@@ -78,7 +146,7 @@ def posix_sleep_with_optional_enter(seconds: float, msg: str) -> bool:
 
 	# If not interactive, just do a cancellable sleep with no hint.
 	if not sys.stdin.isatty():
-		return sleep_with_cancel(seconds)
+		return wait_with_progress("Pause", seconds)
 
 	# Interactive TTY: show a hint and allow Enter to skip via select()
 	print(f"{msg} (Press Enter to skip)")
@@ -424,7 +492,7 @@ class SafetyPacer:
             if not self._unlimited(self.day_cap) and len(self.day_q) >= self.day_cap:
                 sleeps.append(self.day_q[0] + 86400 - now)
             sleep_time = max(1, int(max(sleeps)))
-            if sleep_with_cancel(sleep_time):
+            if wait_with_progress("Safety cap", sleep_time):
                 return
 
     def before_download(self):
@@ -432,22 +500,8 @@ class SafetyPacer:
         delay = random.uniform(self.min_delay, self.max_delay)
         if self.max_delay > 0:
             if os.name == 'nt':
-                # Windows: non-blocking Enter via msvcrt, still honor shutdown
-                print(f"[SAFE] Sleeping {int(delay)}s before download... (Press Enter to skip)")
-                import msvcrt
-                start = time.time()
-                while True:
-                    remaining = delay - (time.time() - start)
-                    if remaining <= 0:
-                        break
-                    if SHUTDOWN.is_set():
-                        return False
-                    if msvcrt.kbhit():
-                        key = msvcrt.getch()
-                        if key in (b'\r', b'\n'):
-                            print("[SAFE] Break skipped by user")
-                            break
-                    SHUTDOWN.wait(0.05)
+                if wait_with_progress("Safety pause", delay, win_enter_skip=True):
+                    return False
             else:
                 # POSIX branch
                 if sys.stdin.isatty():
@@ -459,7 +513,7 @@ class SafetyPacer:
                 else:
                     # Non-interactive (e.g., piped/cron): no hint, cancellable sleep
                     print(f"[SAFE] Sleeping {int(delay)}s before download...")
-                    if sleep_with_cancel(delay):
+                    if wait_with_progress("Pre-download", delay):
                         return False
         return True
 
@@ -474,22 +528,9 @@ class SafetyPacer:
             long_break = random.uniform(self.long_min, self.long_max)
             if self.long_max > 0:
                 if os.name == 'nt':
-                    # Windows: non-blocking Enter via msvcrt, still honor shutdown
                     print(f"[SAFE] Long break: {int(long_break)}s (Press Enter to skip)")
-                    import msvcrt
-                    start = time.time()
-                    while True:
-                        remaining = long_break - (time.time() - start)
-                        if remaining <= 0:
-                            break
-                        if SHUTDOWN.is_set():
-                            return
-                        if msvcrt.kbhit():
-                            key = msvcrt.getch()
-                            if key in (b'\r', b'\n'):
-                                print("[SAFE] Long break skipped by user")
-                                break
-                        SHUTDOWN.wait(0.05)
+                    if wait_with_progress("Long break", long_break, win_enter_skip=True):
+                        return
                 else:
                     if sys.stdin.isatty():
                         if posix_sleep_with_optional_enter(
@@ -498,7 +539,7 @@ class SafetyPacer:
                             return  # shutdown requested; caller will notice via SHUTDOWN
                     else:
                         print(f"[SAFE] Long break: {int(long_break)}s")
-                        if sleep_with_cancel(long_break):
+                        if wait_with_progress("Long break", long_break):
                             return
 
 # Helper to check if a file exists and is non-empty
@@ -612,7 +653,7 @@ def manual_login_and_export_cookies(profile_dir: str, cookie_file: str) -> bool:
 		input("\n[Manual Login] ⚠️  When your feed/profile is visible, press ENTER here... ")
 
 		driver.get("https://www.instagram.com/")
-		if sleep_with_cancel(2):
+		if wait_with_progress("Login pause", 2):
 			return False
 
 		save_cookies_netscape(driver, cookie_file)
@@ -643,7 +684,7 @@ def automated_login_and_export_cookies(config, profile_dir: str, cookie_file: st
 		except:
 			pass
 		
-		if sleep_with_cancel(2):
+		if wait_with_progress("Auto login pause", 2):
 			return False
 		
 		username = config.get('USERNAME')
@@ -660,7 +701,7 @@ def automated_login_and_export_cookies(config, profile_dir: str, cookie_file: st
 		password_field.clear()
 		password_field.send_keys(password)
 		password_field.submit()
-		if sleep_with_cancel(4):
+		if wait_with_progress("Auto login wait", 4):
 			return False
 		
 		if 'login' not in driver.current_url.lower():
@@ -1459,6 +1500,7 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 	if is_downloaded(conn, shortcode):
 		print(f"[SKIPPED] {shortcode} already recorded")
 		SESSION_TRACKER.record_download_skip()
+		PROGRESS.on_skip()
 		return True
 	
 	# Record download attempt
@@ -1488,6 +1530,7 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 		if pacer:
 			pacer.after_success()
 		SESSION_TRACKER.record_download_success()
+		PROGRESS.on_success()
 		return True
 	
 	# Try yt-dlp first
@@ -1551,12 +1594,15 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 				if pacer:
 					pacer.after_success()
 				SESSION_TRACKER.record_download_success()
+				PROGRESS.on_success()
 			elif status == "duplicate":
 				print(f"[DUPLICATE] {shortcode} already in database")
 				SESSION_TRACKER.record_download_skip()
+				PROGRESS.on_skip()
 			else:
 				print(f"[ERROR] {shortcode} → database error")
 				SESSION_TRACKER.record_error(f"Database error for {shortcode}")
+				PROGRESS.on_failure()
 			return True
 		else:
 			print(f"yt-dlp failed for {shortcode}: {result.stderr}")
@@ -1646,10 +1692,13 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 					print(f"[LINK]  {to_file_uri(saved_path)}")
 				if pacer:
 					pacer.after_success()
+				PROGRESS.on_success()
 			elif status == "duplicate":
 				print(f"[DUPLICATE] {shortcode} already in database")
+				PROGRESS.on_skip()
 			else:
 				print(f"[ERROR] {shortcode} → database error")
+				PROGRESS.on_failure()
 			return True
 		else:
 			print(f"gallery-dl failed for {shortcode}: {result.stderr}")
@@ -1666,11 +1715,13 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 		print(f"[ERROR] {shortcode} → {error_msg}")
 		SESSION_TRACKER.record_download_failure()
 		SESSION_TRACKER.record_error(f"Download failed: {shortcode} - {error_msg}")
+		PROGRESS.on_failure()
 	elif status == "duplicate":
 		print(f"[DUPLICATE] {shortcode} failure already recorded")
 	else:
 		print(f"[ERROR] {shortcode} → database error recording failure")
 		SESSION_TRACKER.record_error(f"Database error recording failure for {shortcode}")
+		PROGRESS.on_failure()
 	
 	# Log total failure to file for debugging
 	try:
@@ -1768,7 +1819,7 @@ def get_profile_post_urls(username):
                 print(f"[PROFILE] Post grid not found, trying to scroll for @{username}")
             
             # Scroll down to load more posts
-            if sleep_with_cancel(3):
+            if wait_with_progress("Scroll pause", 3):
                 return [], {}
             
             # Scroll down to load all posts and collect URLs during scrolling
@@ -1788,7 +1839,7 @@ def get_profile_post_urls(username):
                 
                 # Scroll down
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                if sleep_with_cancel(2):
+                if wait_with_progress("Scroll pause", 2):
                     return [], {}
                 
                 # Check if new content loaded
@@ -1808,7 +1859,7 @@ def get_profile_post_urls(username):
             all_post_data.update(final_post_data)
             
             # Wait a bit more for posts to load
-            if sleep_with_cancel(3):
+            if wait_with_progress("Scroll settle", 3):
                 return [], {}
             
             # Get page source
@@ -1951,19 +2002,19 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                     print("[Advice] Waiting ~30–60 minutes is safest before retrying to avoid repeated blocks.")
                     auto_retry = parse_bool(safety_config.get('AUTO_RETRY_ON_RATE_LIMIT'), True) if safety_config else True
                     if auto_retry:
-                        base_delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
+                        base_delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE) - 1)]
                         delay = get_jittered_delay(base_delay)
                         print(f"[BLOCK] Auto-retrying this item in {delay}s (base: {base_delay}s + jitter)...")
-                        if sleep_with_cancel(delay):
+                        if wait_with_progress("Rate limit", delay):
                             return False  # Shutdown requested
                         retry_count += 1
                         continue
                     # interactive mode
                     if retry_count > 0:  # delayed retry mode
-                        base_delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
+                        base_delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE) - 1)]
                         delay = get_jittered_delay(base_delay)
                         print(f"[BLOCK] Delayed retry mode: sleeping {delay}s (base: {base_delay}s + jitter) before retry...")
-                        if sleep_with_cancel(delay):
+                        if wait_with_progress("Rate limit", delay):
                             return False  # Shutdown requested
                         retry_count += 1
                         continue
@@ -1997,7 +2048,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                             print("[BLOCK] Manual login completed, retrying...")
                         else:
                             print("[BLOCK] Manual login failed, retrying anyway...")
-                        # else retry immediately
+                    # else retry immediately
                 except LoginRequiredError as e:
                     print(f"\n[BLOCK] Login required (cookies/session invalid).")
                     print("[Advice] Revalidate cookies via MANUAL LOGIN, then retry.")
@@ -2048,247 +2099,253 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
         bool: True if processing completed successfully
     """
     print("Processing DM downloads...")
-    
-    # Find message_1.json files in the inbox
-    inbox_dir = os.path.join(selected_path, DM_INBOX_PATH)
-    if not os.path.exists(inbox_dir):
-        print(f"DM inbox directory not found: {inbox_dir}")
-        return False
-    
-    message_files = []
-    for root, dirs, files in os.walk(inbox_dir):
-        if 'message_1.json' in files:
-            message_files.append(os.path.join(root, 'message_1.json'))
-    
-    if not message_files:
-        print("No message files found in DM inbox")
-        return False
-    
-    print(f"Found {len(message_files)} DM conversations")
-    
-    # Display available DM conversations
-    print("\nAvailable DM conversations:")
-    for i, msg_file in enumerate(message_files, 1):
-        thread_name = os.path.basename(os.path.dirname(msg_file))
-        print(f"{i}. {thread_name}")
-    print("a) Download all conversations")
-    print("b) Back to options menu")
-    print("q) Quit")
-    
-    # Get user selection
-    while True:
-        choice = input("\nSelect which conversation(s) to download (number, 'a' for all, 'b' for back, or 'q' to quit): ").strip().lower()
-        
-        if choice == 'q':
-            print("Quitting.")
+    PROGRESS.start(0)
+    try:
+        # Find message_1.json files in the inbox
+        inbox_dir = os.path.join(selected_path, DM_INBOX_PATH)
+        if not os.path.exists(inbox_dir):
+            print(f"DM inbox directory not found: {inbox_dir}")
             return False
-        elif choice == 'b':
-            print("Returning to options menu.")
-            return None  # Special return value to indicate "back"
-        elif choice == 'a':
-            selected_files = message_files
-            break
-        elif choice.isdigit():
-            num = int(choice)
-            if 1 <= num <= len(message_files):
-                selected_files = [message_files[num - 1]]
+
+        message_files = []
+        for root, dirs, files in os.walk(inbox_dir):
+            if 'message_1.json' in files:
+                message_files.append(os.path.join(root, 'message_1.json'))
+
+        if not message_files:
+            print("No message files found in DM inbox")
+            return False
+
+        print(f"Found {len(message_files)} DM conversations")
+
+        # Display available DM conversations
+        print("\nAvailable DM conversations:")
+        for i, msg_file in enumerate(message_files, 1):
+            thread_name = os.path.basename(os.path.dirname(msg_file))
+            print(f"{i}. {thread_name}")
+        print("a) Download all conversations")
+        print("b) Back to options menu")
+        print("q) Quit")
+
+        # Get user selection
+        while True:
+            choice = input("\nSelect which conversation(s) to download (number, 'a' for all, 'b' for back, or 'q' to quit): ").strip().lower()
+
+            if choice == 'q':
+                print("Quitting.")
+                return False
+            elif choice == 'b':
+                print("Returning to options menu.")
+                return None  # Special return value to indicate "back"
+            elif choice == 'a':
+                selected_files = message_files
                 break
+            elif choice.isdigit():
+                num = int(choice)
+                if 1 <= num <= len(message_files):
+                    selected_files = [message_files[num - 1]]
+                    break
+                else:
+                    print(f"Invalid choice. Please enter a number between 1 and {len(message_files)}, 'a', 'b', or 'q'.")
             else:
                 print(f"Invalid choice. Please enter a number between 1 and {len(message_files)}, 'a', 'b', or 'q'.")
-        else:
-            print(f"Invalid choice. Please enter a number between 1 and {len(message_files)}, 'a', 'b', or 'q'.")
-    
-    # Get download directory from config
-    config = read_config()
-    download_base_dir = config.get('DOWNLOAD_DIRECTORY', os.path.join(os.path.dirname(__file__), 'downloads'))
-    
-    # Parse send message append config
-    ASK_FOR_SEND_MESSAGE_APPEND = parse_bool(config.get("ASK_FOR_SEND_MESSAGE_APPEND"), False)
-    
-    # Create download directory structure
-    dm_download_dir = os.path.join(download_base_dir, "dms")
-    os.makedirs(dm_download_dir, exist_ok=True)
-    
-    print(f"Downloads will be saved to: {dm_download_dir}")
-    
-    total_posts = 0
-    total_profiles = 0
-    
-    for msg_file in selected_files:
-        thread_name = os.path.basename(os.path.dirname(msg_file))
-        print(f"\nProcessing {thread_name}...")
-        
-        thread_dir = ensure_thread_dir(dm_download_dir, thread_name)
-        print(f"[DM] Saving this conversation to: {thread_dir}")
-        
-        # Gather all message parts for this DM thread
-        thread_root = os.path.dirname(msg_file)  # msg_file is the selected message_*.json
-        part_files = sorted(glob(os.path.join(thread_root, "message_*.json")))
 
-        all_msgs = []
-        for pf in part_files:
-            try:
-                with open(pf, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    all_msgs.extend(data.get("messages", []))
-            except Exception as e:
-                print(f"[DM] Skipping {pf}: {e}")
+        # Get download directory from config
+        config = read_config()
+        download_base_dir = config.get('DOWNLOAD_DIRECTORY', os.path.join(os.path.dirname(__file__), 'downloads'))
 
-        # Sort by ascending timestamp for reliable <1s pairing across parts
-        all_msgs.sort(key=lambda m: m.get("timestamp_ms", 0))
+        # Parse send message append config
+        ASK_FOR_SEND_MESSAGE_APPEND = parse_bool(config.get("ASK_FOR_SEND_MESSAGE_APPEND"), False)
 
-        seen_shortcodes = set()
-        posts = []
-        send_text_hits = 0
+        # Create download directory structure
+        dm_download_dir = os.path.join(download_base_dir, "dms")
+        os.makedirs(dm_download_dir, exist_ok=True)
 
-        for i, m in enumerate(all_msgs):
-            share = m.get("share") or {}
-            link = share.get("link")
-            if not link:
-                continue  # no raw-link fallback; only structured shares
+        print(f"Downloads will be saved to: {dm_download_dir}")
 
-            shortcode = _shortcode_from_share_link(link)
-            if not shortcode or shortcode in seen_shortcodes:
-                continue
-            seen_shortcodes.add(shortcode)
+        total_posts = 0
+        total_profiles = 0
 
-            ts = m.get("timestamp_ms")
-            sender = (m.get("sender_name") or "").strip()
-            orig_owner = (share.get("original_content_owner") or "").strip() or None
+        for msg_file in selected_files:
+            thread_name = os.path.basename(os.path.dirname(msg_file))
+            print(f"\nProcessing {thread_name}...")
 
-            # Pair a send message if next is same sender and within <1s
-            send_text = None
-            if i + 1 < len(all_msgs):
-                nxt = all_msgs[i + 1]
-                if (nxt.get("sender_name") or "").strip() == sender:
-                    nts = nxt.get("timestamp_ms")
-                    if isinstance(ts, int) and isinstance(nts, int) and 0 <= (nts - ts) <= 1000:
-                        if isinstance(nxt.get("content"), str) and nxt["content"].strip():
-                            send_text = nxt["content"].strip()
-                            send_text_hits += 1
+            thread_dir = ensure_thread_dir(dm_download_dir, thread_name)
+            print(f"[DM] Saving this conversation to: {thread_dir}")
 
-            post = {
-                'shortcode': shortcode,
-                'url': link,
-                'description': None,
-                'original_owner': orig_owner,
-                # do not set caption here; sidecar will populate it
-                'source': 'dm',
-                'username': orig_owner,
-                'timestamp_ms': ts,
-                'dm_thread': thread_name,
-            }
-            if send_text:
-                post['send_text'] = send_text
+            # Gather all message parts for this DM thread
+            thread_root = os.path.dirname(msg_file)  # msg_file is the selected message_*.json
+            part_files = sorted(glob(os.path.join(thread_root, "message_*.json")))
 
-            posts.append(post)
-
-        print(f"Found {len(posts)} shared posts from {len(part_files)} message parts")
-        
-        # Check for send message append option
-        append_send_for_this_run = False
-        if ASK_FOR_SEND_MESSAGE_APPEND and send_text_hits > 0:
-            print(f"Detected {send_text_hits} send messages (<1s after shares) in this conversation.")
-            choice = input("Append them to filenames for this run? [y/N]: ").strip().lower()
-            append_send_for_this_run = (choice == 'y')
-        
-        # Download the collected posts for this thread into the per-thread folder
-        for i, post in enumerate(posts, 1):
-            if SHUTDOWN.is_set():
-                break
-            print(f"Downloading post {i}/{len(posts)}: {post['shortcode']}")
-            
-            # Add send message flag to post data
-            post['append_send_for_this_run'] = append_send_for_this_run
-            
-            # Use our existing download method with exception handling
-            retry_count = 0
-            while True:
+            all_msgs = []
+            for pf in part_files:
                 try:
-                    ok = download_post(conn, post, thread_dir, pacer, config)
-                    # success or non-block failure -> break to next item
-                    if ok:
-                        total_posts += 1
-                    break
-                except RateLimitError as e:
-                    print(f"\n[BLOCK] Rate limited.")
-                    print("[Advice] Waiting ~30–60 minutes is safest before retrying to avoid repeated blocks.")
-                    auto_retry = parse_bool(safety_config.get('AUTO_RETRY_ON_RATE_LIMIT'), True) if safety_config else True
-                    if auto_retry:
-                        delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
-                        print(f"[BLOCK] Auto-retrying this item in {delay}s...")
-                        if sleep_with_cancel(delay):
-                            return False  # Shutdown requested
-                        retry_count += 1
-                        continue
-                    # interactive mode
-                    if retry_count > 0:  # delayed retry mode
-                        delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
-                        print(f"[BLOCK] Delayed retry mode: sleeping {delay}s before retry...")
-                        if sleep_with_cancel(delay):
-                            return False  # Shutdown requested
-                        retry_count += 1
-                        continue
-                    resp = input("[Enter]=retry now  |  D=delayed exponential retry  |  S=skip this item  |  Q=quit run > ").strip().lower()
-                    if resp == "q":
-                        return False
-                    if resp == "s":
-                        record_failure(conn, post, "Skipped after rate limit")
-                        break
-                    if resp == "d":
-                        retry_count = 0  # start delayed retry mode at first step
-                        continue  # loop will sleep next time
-                    # default: immediate retry
+                    with open(pf, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        all_msgs.extend(data.get("messages", []))
+                except Exception as e:
+                    print(f"[DM] Skipping {pf}: {e}")
+
+            # Sort by ascending timestamp for reliable <1s pairing across parts
+            all_msgs.sort(key=lambda m: m.get("timestamp_ms", 0))
+
+            seen_shortcodes = set()
+            posts = []
+            send_text_hits = 0
+
+            for i, m in enumerate(all_msgs):
+                share = m.get("share") or {}
+                link = share.get("link")
+                if not link:
+                    continue  # no raw-link fallback; only structured shares
+
+                shortcode = _shortcode_from_share_link(link)
+                if not shortcode or shortcode in seen_shortcodes:
                     continue
-                except CheckpointError as e:
-                    print(f"\n[BLOCK] Checkpoint/challenge.")
-                    print("[Advice] Complete MANUAL LOGIN with the same persistent profile (or wait/switch), then retry.")
-                    print("[Advice] After clearing the challenge, waiting ~30–60 minutes before resuming is safest.")
-                    resp = input("[Enter]=retry  |  M=manual login now  |  S=skip  |  Q=quit > ").strip().lower()
-                    if resp == "q":
-                        return False
-                    if resp == "s":
-                        record_failure(conn, post, "Skipped during checkpoint")
-                        break
-                    if resp == "m":
-                        # Get current profile and cookie file
-                        config = read_config()
-                        profile_dir, cookie_file = resolve_profile_and_cookie(config)
-                        if manual_login_and_export_cookies(profile_dir, cookie_file):
-                            print("[BLOCK] Manual login completed, retrying...")
-                        else:
-                            print("[BLOCK] Manual login failed, retrying anyway...")
-                        # else retry immediately
-                except LoginRequiredError as e:
-                    print(f"\n[BLOCK] Login required (cookies/session invalid).")
-                    print("[Advice] Revalidate cookies via MANUAL LOGIN, then retry.")
-                    resp = input("[M]=manual login now  |  R=retry with current cookies  |  S=skip  |  Q=quit > ").strip().lower()
-                    if resp == "q":
-                        return False
-                    if resp == "s":
-                        record_failure(conn, post, "Skipped after login-required")
-                        break
-                    if resp == "m":
-                        # Get current profile and cookie file
-                        config = read_config()
-                        profile_dir, cookie_file = resolve_profile_and_cookie(config)
-                        if manual_login_and_export_cookies(profile_dir, cookie_file):
-                            print("[BLOCK] Manual login completed, retrying...")
-                        else:
-                            print("[BLOCK] Manual login failed, retrying anyway...")
-                    # else retry immediately
-                except NotFoundError as e:
-                    print(f"[SKIP] Post unavailable/deleted/private: {post['shortcode']}")
-                    record_failure(conn, post, "Deleted/private/unavailable")
-                    SESSION_TRACKER.record_download_skip()
+                seen_shortcodes.add(shortcode)
+
+                ts = m.get("timestamp_ms")
+                sender = (m.get("sender_name") or "").strip()
+                orig_owner = (share.get("original_content_owner") or "").strip() or None
+
+                # Pair a send message if next is same sender and within <1s
+                send_text = None
+                if i + 1 < len(all_msgs):
+                    nxt = all_msgs[i + 1]
+                    if (nxt.get("sender_name") or "").strip() == sender:
+                        nts = nxt.get("timestamp_ms")
+                        if isinstance(ts, int) and isinstance(nts, int) and 0 <= (nts - ts) <= 1000:
+                            if isinstance(nxt.get("content"), str) and nxt["content"].strip():
+                                send_text = nxt["content"].strip()
+                                send_text_hits += 1
+
+                post = {
+                    'shortcode': shortcode,
+                    'url': link,
+                    'description': None,
+                    'original_owner': orig_owner,
+                    # do not set caption here; sidecar will populate it
+                    'source': 'dm',
+                    'username': orig_owner,
+                    'timestamp_ms': ts,
+                    'dm_thread': thread_name,
+                }
+                if send_text:
+                    post['send_text'] = send_text
+
+                posts.append(post)
+
+            print(f"Found {len(posts)} shared posts from {len(part_files)} message parts")
+            if posts:
+                PROGRESS.add_total(len(posts))
+
+            # Check for send message append option
+            append_send_for_this_run = False
+            if ASK_FOR_SEND_MESSAGE_APPEND and send_text_hits > 0:
+                print(f"Detected {send_text_hits} send messages (<1s after shares) in this conversation.")
+                choice = input("Append them to filenames for this run? [y/N]: ").strip().lower()
+                append_send_for_this_run = (choice == 'y')
+
+            # Download the collected posts for this thread into the per-thread folder
+            for i, post in enumerate(posts, 1):
+                if SHUTDOWN.is_set():
                     break
-    
-    if not SHUTDOWN.is_set():
-        print(f"\nDM download complete!")
-        print(f"Total posts downloaded: {total_posts}")
-        print(f"Total profiles processed: {total_profiles}")
-    
-        return True
+                print(f"Downloading post {i}/{len(posts)}: {post['shortcode']}")
+
+                # Add send message flag to post data
+                post['append_send_for_this_run'] = append_send_for_this_run
+
+                # Use our existing download method with exception handling
+                retry_count = 0
+                while True:
+                    try:
+                        ok = download_post(conn, post, thread_dir, pacer, config)
+                        # success or non-block failure -> break to next item
+                        if ok:
+                            total_posts += 1
+                        break
+                    except RateLimitError as e:
+                        print(f"\n[BLOCK] Rate limited.")
+                        print("[Advice] Waiting ~30–60 minutes is safest before retrying to avoid repeated blocks.")
+                        auto_retry = parse_bool(safety_config.get('AUTO_RETRY_ON_RATE_LIMIT'), True) if safety_config else True
+                        if auto_retry:
+                            delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE) - 1)]
+                            print(f"[BLOCK] Auto-retrying this item in {delay}s...")
+                            if wait_with_progress("Rate limit", delay):
+                                return False  # Shutdown requested
+                            retry_count += 1
+                            continue
+                        # interactive mode
+                        if retry_count > 0:  # delayed retry mode
+                            delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE) - 1)]
+                            print(f"[BLOCK] Delayed retry mode: sleeping {delay}s before retry...")
+                            if wait_with_progress("Rate limit", delay):
+                                return False  # Shutdown requested
+                            retry_count += 1
+                            continue
+                        resp = input("[Enter]=retry now  |  D=delayed exponential retry  |  S=skip this item  |  Q=quit run > ").strip().lower()
+                        if resp == "q":
+                            return False
+                        if resp == "s":
+                            record_failure(conn, post, "Skipped after rate limit")
+                            break
+                        if resp == "d":
+                            retry_count = 0  # start delayed retry mode at first step
+                            continue  # loop will sleep next time
+                        # default: immediate retry
+                        continue
+                    except CheckpointError as e:
+                        print(f"\n[BLOCK] Checkpoint/challenge.")
+                        print("[Advice] Complete MANUAL LOGIN with the same persistent profile (or wait/switch), then retry.")
+                        print("[Advice] After clearing the challenge, waiting ~30–60 minutes before resuming is safest.")
+                        resp = input("[Enter]=retry  |  M=manual login now  |  S=skip  |  Q=quit > ").strip().lower()
+                        if resp == "q":
+                            return False
+                        if resp == "s":
+                            record_failure(conn, post, "Skipped during checkpoint")
+                            break
+                        if resp == "m":
+                            # Get current profile and cookie file
+                            config = read_config()
+                            profile_dir, cookie_file = resolve_profile_and_cookie(config)
+                            if manual_login_and_export_cookies(profile_dir, cookie_file):
+                                print("[BLOCK] Manual login completed, retrying...")
+                            else:
+                                print("[BLOCK] Manual login failed, retrying anyway...")
+                        # else retry immediately
+                    except LoginRequiredError as e:
+                        print(f"\n[BLOCK] Login required (cookies/session invalid).")
+                        print("[Advice] Revalidate cookies via MANUAL LOGIN, then retry.")
+                        resp = input("[M]=manual login now  |  R=retry with current cookies  |  S=skip  |  Q=quit > ").strip().lower()
+                        if resp == "q":
+                            return False
+                        if resp == "s":
+                            record_failure(conn, post, "Skipped after login-required")
+                            break
+                        if resp == "m":
+                            # Get current profile and cookie file
+                            config = read_config()
+                            profile_dir, cookie_file = resolve_profile_and_cookie(config)
+                            if manual_login_and_export_cookies(profile_dir, cookie_file):
+                                print("[BLOCK] Manual login completed, retrying...")
+                            else:
+                                print("[BLOCK] Manual login failed, retrying anyway...")
+                        # else retry immediately
+                    except NotFoundError as e:
+                        print(f"[SKIP] Post unavailable/deleted/private: {post['shortcode']}")
+                        record_failure(conn, post, "Deleted/private/unavailable")
+                        SESSION_TRACKER.record_download_skip()
+                        PROGRESS.on_skip()
+                        break
+
+        if not SHUTDOWN.is_set():
+            print(f"\nDM download complete!")
+            print(f"Total posts downloaded: {total_posts}")
+            print(f"Total profiles processed: {total_profiles}")
+
+            return True
+    finally:
+        PROGRESS.finish()
 
 def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, config: dict):
 	"""
@@ -2322,28 +2379,33 @@ def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 			filtered.append(p)
 
 	print(f"Found {len(filtered)} liked post(s). Starting downloads...")
+	PROGRESS.start(len(filtered))
+	try:
 
-	for idx, post in enumerate(filtered, 1):
-		if SHUTDOWN.is_set():
-			print("Shutdown requested. Exiting liked-posts loop.")
-			return False
+		for idx, post in enumerate(filtered, 1):
+			if SHUTDOWN.is_set():
+				print("Shutdown requested. Exiting liked-posts loop.")
+				return False
 
-		shortcode = post.get('shortcode')
-		if not shortcode:
-			continue
+			shortcode = post.get('shortcode')
+			if not shortcode:
+				continue
 
-		# If any source already downloaded this shortcode, skip silently (no DB write).
-		if is_downloaded(conn, shortcode):
-			print(f"[SKIP] {shortcode} already downloaded")
-			SESSION_TRACKER.record_download_skip()
-			continue
+			# If any source already downloaded this shortcode, skip silently (no DB write).
+			if is_downloaded(conn, shortcode):
+				print(f"[SKIP] {shortcode} already downloaded")
+				SESSION_TRACKER.record_download_skip()
+				PROGRESS.on_skip()
+				continue
 
-		ok = download_post(conn, post, target_dir, pacer=pacer, config=config)
-		if not ok and SHUTDOWN.is_set():
-			return False
+			ok = download_post(conn, post, target_dir, pacer=pacer, config=config)
+			if not ok and SHUTDOWN.is_set():
+				return False
 
-	print("Liked posts processing complete.")
-	return True
+		print("Liked posts processing complete.")
+		return True
+	finally:
+		PROGRESS.finish()
 
 def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, config: dict):
 	"""
@@ -2373,71 +2435,77 @@ def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 		return True
 
 	download_base_dir = config.get("DOWNLOAD_DIRECTORY", os.path.join(os.path.dirname(__file__), "downloads"))
-
-	for i, post in enumerate(all_posts, 1):
-		if SHUTDOWN.is_set():
-			print("[STOP] Cancelled by user.")
-			break
-
-		shortcode = post["shortcode"]
-		# Skip re-downloads if any source already succeeded for this shortcode
-		if is_downloaded(conn, shortcode):
-			print(f"[SKIP] Already downloaded {shortcode}")
-			continue
-
-		# Resolve target dir per collection
-		collection_name = post.get("_collection") or UNSORTED_COLLECTION_DIRNAME
-		target_dir = ensure_collection_dir(download_base_dir, collection_name)
-
-		retry_count = 0
-		while True:
-			try:
-				ok = download_post(conn, post, target_dir, pacer, config)
-				if ok and pacer:
-					pacer.after_success()
+	PROGRESS.start(len(all_posts))
+	try:
+		for i, post in enumerate(all_posts, 1):
+			if SHUTDOWN.is_set():
+				print("[STOP] Cancelled by user.")
 				break
 
-			except RateLimitError:
-				SESSION_TRACKER.record_rate_limit()
-				base_delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE) - 1)]
-				delay = get_jittered_delay(base_delay)
-				print(f"[BLOCK] Rate limited. Retrying in {delay}s.")
-				if sleep_with_cancel(delay):
-					return False
-				retry_count += 1
-
-			except CheckpointError:
-				print("[BLOCK] Checkpoint/challenge. Use manual login then retry.")
-				resp = input("[Enter]=retry  |  M=manual login  |  S=skip  |  Q=quit > ").strip().lower()
-				if resp == "q": return False
-				if resp == "s":
-					record_failure(conn, post, "Skipped during checkpoint")
-					break
-				if resp == "m":
-					# Re-run your existing manual-login path
-					config = read_config()
-					profile_dir, cookie_file = resolve_profile_and_cookie(config)
-					manual_login_and_export_cookies(profile_dir, cookie_file)
-				# else retry
-
-			except LoginRequiredError:
-				print("[BLOCK] Login required. Revalidate cookies.")
-				resp = input("[M]=manual login  |  R=retry  |  S=skip  |  Q=quit > ").strip().lower()
-				if resp == "q": return False
-				if resp == "s":
-					record_failure(conn, post, "Skipped after login-required")
-					break
-				if resp == "m":
-					config = read_config()
-					profile_dir, cookie_file = resolve_profile_and_cookie(config)
-					manual_login_and_export_cookies(profile_dir, cookie_file)
-
-			except NotFoundError:
-				print(f"[SKIP] Unavailable/deleted/private: {shortcode}")
-				record_failure(conn, post, "Deleted/private/unavailable")
+			shortcode = post["shortcode"]
+			# Skip re-downloads if any source already succeeded for this shortcode
+			if is_downloaded(conn, shortcode):
+				print(f"[SKIP] Already downloaded {shortcode}")
 				SESSION_TRACKER.record_download_skip()
-				break
-	return True
+				PROGRESS.on_skip()
+				continue
+
+			# Resolve target dir per collection
+			collection_name = post.get("_collection") or UNSORTED_COLLECTION_DIRNAME
+			target_dir = ensure_collection_dir(download_base_dir, collection_name)
+
+			retry_count = 0
+			while True:
+				try:
+					ok = download_post(conn, post, target_dir, pacer, config)
+					if ok and pacer:
+						pacer.after_success()
+					break
+
+				except RateLimitError:
+					SESSION_TRACKER.record_rate_limit()
+					base_delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE) - 1)]
+					delay = get_jittered_delay(base_delay)
+					print(f"[BLOCK] Rate limited. Retrying in {delay}s.")
+					if wait_with_progress("Rate limit", delay):
+						return False
+					retry_count += 1
+
+				except CheckpointError:
+					print("[BLOCK] Checkpoint/challenge. Use manual login then retry.")
+					resp = input("[Enter]=retry  |  M=manual login  |  S=skip  |  Q=quit > ").strip().lower()
+					if resp == "q": return False
+					if resp == "s":
+						record_failure(conn, post, "Skipped during checkpoint")
+						break
+					if resp == "m":
+						# Re-run your existing manual-login path
+						config = read_config()
+						profile_dir, cookie_file = resolve_profile_and_cookie(config)
+						manual_login_and_export_cookies(profile_dir, cookie_file)
+					# else retry
+
+				except LoginRequiredError:
+					print("[BLOCK] Login required. Revalidate cookies.")
+					resp = input("[M]=manual login  |  R=retry  |  S=skip  |  Q=quit > ").strip().lower()
+					if resp == "q": return False
+					if resp == "s":
+						record_failure(conn, post, "Skipped after login-required")
+						break
+					if resp == "m":
+						config = read_config()
+						profile_dir, cookie_file = resolve_profile_and_cookie(config)
+						manual_login_and_export_cookies(profile_dir, cookie_file)
+
+				except NotFoundError:
+					print(f"[SKIP] Unavailable/deleted/private: {shortcode}")
+					record_failure(conn, post, "Deleted/private/unavailable")
+					SESSION_TRACKER.record_download_skip()
+					PROGRESS.on_skip()
+					break
+		return True
+	finally:
+		PROGRESS.finish()
 
 def read_config():
     config = {}
@@ -2879,90 +2947,201 @@ def print_ffmpeg_warning():
     print()
 
 # --- Session tracking for summary ---
+class ProgressRenderer:
+	"""
+	Render a sticky bottom-line progress bar plus lightweight helpers to
+	keep it visible while other log lines scroll.
+	"""
+	def __init__(self, bar_cells: int = 20):
+		self.bar_cells = max(5, bar_cells)
+		self.reset()
+
+	def reset(self, total: int = 0):
+		self.total = max(0, total)
+		self.success = 0
+		self.failure = 0
+		self.skipped = 0
+		self.start_ts = time.time()
+		self.active = False
+
+	def start(self, total: int = 0):
+		self.reset(total)
+		self.active = True
+		self.render()
+
+	def finish(self):
+		if not self.active:
+			return
+		self._clear_line()
+		print()  # release the line so the prompt/logs don't sit on it
+		self.active = False
+
+	def add_total(self, n: int):
+		if not self.active:
+			return
+		self.total += max(0, n)
+		self.render()
+
+	def on_success(self):
+		if not self.active:
+			return
+		self.success += 1
+		self.render()
+
+	def on_skip(self):
+		if not self.active:
+			return
+		self.skipped += 1
+		self.render()
+
+	def on_failure(self):
+		if not self.active:
+			return
+		self.failure += 1
+		self.render()
+
+	def log(self, msg: str):
+		"""Print a scrolling log line while keeping the sticky bar intact."""
+		if self.active:
+			self._clear_line()
+		print(msg)
+		if self.active:
+			self.render()
+
+	def render(self):
+		if not self.active:
+			return
+		width = shutil.get_terminal_size((100, 20)).columns
+		done = self.success + self.failure + self.skipped
+		total = self.total if self.total > 0 else 0
+		percent = (done / total * 100) if total else 0.0
+		bar = self._bar(done, total)
+		elapsed = self._fmt_elapsed(time.time() - self.start_ts)
+		total_display = str(self.total) if self.total > 0 else "?"
+		line = f"[Overall] {done}/{total_display} ({percent:.1f}%) {bar}  Elapsed {elapsed}  OK:{self.success} Fail:{self.failure} Skip:{self.skipped}"
+		line = line[:width - 1]
+		print("\r" + line.ljust(width - 1), end='', flush=True)
+
+	def render_line(self) -> str:
+		"""Return the current sticky line text (without newline)."""
+		if not self.active:
+			return ""
+		width = shutil.get_terminal_size((100, 20)).columns
+		done = self.success + self.failure + self.skipped
+		total = self.total if self.total > 0 else 0
+		percent = (done / total * 100) if total else 0.0
+		bar = self._bar(done, total)
+		elapsed = self._fmt_elapsed(time.time() - self.start_ts)
+		total_display = str(self.total) if self.total > 0 else "?"
+		line = f"[Overall] {done}/{total_display} ({percent:.1f}%) {bar}  Elapsed {elapsed}  OK:{self.success} Fail:{self.failure} Skip:{self.skipped}"
+		return line[:width - 1].ljust(width - 1)
+
+	def _bar(self, done: int, total: int) -> str:
+		if total <= 0:
+			filled = 0
+		else:
+			filled = int((done / total) * self.bar_cells)
+		filled = max(0, min(self.bar_cells, filled))
+		empty = self.bar_cells - filled
+		return "▰" * filled + "▱" * empty
+
+	def _fmt_elapsed(self, seconds: float) -> str:
+		seconds = int(seconds)
+		h = seconds // 3600
+		m = (seconds % 3600) // 60
+		s = seconds % 60
+		return f"{h:02d}:{m:02d}:{s:02d}"
+
+	def _clear_line(self):
+		width = shutil.get_terminal_size((100, 20)).columns
+		print("\r" + " " * (width - 1), end='\r', flush=True)
+
+
 class SessionTracker:
-    def __init__(self):
-        self.start_time = time.time()
-        self.downloads_attempted = 0
-        self.downloads_successful = 0
-        self.downloads_failed = 0
-        self.downloads_skipped = 0
-        self.rate_limits_hit = 0
-        self.checkpoints_hit = 0
-        self.login_required_hits = 0
-        self.errors = []
-        self.dry_run = False
-    
-    def set_dry_run(self, value: bool):
-        self.dry_run = value
-    
-    def record_download_attempt(self):
-        self.downloads_attempted += 1
-    
-    def record_download_success(self):
-        self.downloads_successful += 1
-    
-    def record_download_failure(self):
-        self.downloads_failed += 1
-    
-    def record_download_skip(self):
-        self.downloads_skipped += 1
-    
-    def record_rate_limit(self):
-        self.rate_limits_hit += 1
-    
-    def record_checkpoint(self):
-        self.checkpoints_hit += 1
-    
-    def record_login_required(self):
-        self.login_required_hits += 1
-    
-    def record_error(self, error_msg):
-        self.errors.append(error_msg)
-    
-    def get_session_summary(self):
-        """Generate a comprehensive session summary."""
-        duration = time.time() - self.start_time
-        hours = int(duration // 3600)
-        minutes = int((duration % 3600) // 60)
-        seconds = int(duration % 60)
-        
-        summary = []
-        summary.append("\n" + "="*60)
-        summary.append("📊 SESSION SUMMARY")
-        if self.dry_run:
-            summary.append("⚠️  DRY RUN MODE - No files downloaded, no database writes")
-        summary.append("="*60)
-        summary.append(f"Session duration: {hours:02d}:{minutes:02d}:{seconds:02d}")
-        summary.append("")
-        summary.append("Download Statistics:")
-        summary.append(f"  • Attempted: {self.downloads_attempted}")
-        summary.append(f"  • Successful: {self.downloads_successful}")
-        summary.append(f"  • Failed: {self.downloads_failed}")
-        summary.append(f"  • Skipped: {self.downloads_skipped}")
-        
-        if self.downloads_attempted > 0:
-            success_rate = (self.downloads_successful / self.downloads_attempted) * 100
-            summary.append(f"  • Success rate: {success_rate:.1f}%")
-        
-        summary.append("")
-        summary.append("Rate Limiting Events:")
-        summary.append(f"  • Rate limits hit: {self.rate_limits_hit}")
-        summary.append(f"  • Checkpoints encountered: {self.checkpoints_hit}")
-        summary.append(f"  • Login required events: {self.login_required_hits}")
-        
-        if self.errors:
-            summary.append("")
-            summary.append("Errors encountered:")
-            for error in self.errors[-5:]:  # Show last 5 errors
-                summary.append(f"  • {error}")
-            if len(self.errors) > 5:
-                summary.append(f"  • ... and {len(self.errors) - 5} more errors")
-        
-        summary.append("="*60)
-        return "\n".join(summary)
+	def __init__(self):
+		self.start_time = time.time()
+		self.downloads_attempted = 0
+		self.downloads_successful = 0
+		self.downloads_failed = 0
+		self.downloads_skipped = 0
+		self.rate_limits_hit = 0
+		self.checkpoints_hit = 0
+		self.login_required_hits = 0
+		self.errors = []
+		self.dry_run = False
+	
+	def set_dry_run(self, value: bool):
+		self.dry_run = value
+	
+	def record_download_attempt(self):
+		self.downloads_attempted += 1
+	
+	def record_download_success(self):
+		self.downloads_successful += 1
+	
+	def record_download_failure(self):
+		self.downloads_failed += 1
+	
+	def record_download_skip(self):
+		self.downloads_skipped += 1
+	
+	def record_rate_limit(self):
+		self.rate_limits_hit += 1
+	
+	def record_checkpoint(self):
+		self.checkpoints_hit += 1
+	
+	def record_login_required(self):
+		self.login_required_hits += 1
+	
+	def record_error(self, error_msg):
+		self.errors.append(error_msg)
+	
+	def get_session_summary(self):
+		"""Generate a comprehensive session summary."""
+		duration = time.time() - self.start_time
+		hours = int(duration // 3600)
+		minutes = int((duration % 3600) // 60)
+		seconds = int(duration % 60)
+		
+		summary = []
+		summary.append("\n" + "="*60)
+		summary.append("📊 SESSION SUMMARY")
+		if self.dry_run:
+			summary.append("⚠️  DRY RUN MODE - No files downloaded, no database writes")
+		summary.append("="*60)
+		summary.append(f"Session duration: {hours:02d}:{minutes:02d}:{seconds:02d}")
+		summary.append("")
+		summary.append("Download Statistics:")
+		summary.append(f"  • Attempted: {self.downloads_attempted}")
+		summary.append(f"  • Successful: {self.downloads_successful}")
+		summary.append(f"  • Failed: {self.downloads_failed}")
+		summary.append(f"  • Skipped: {self.downloads_skipped}")
+		
+		if self.downloads_attempted > 0:
+			success_rate = (self.downloads_successful / self.downloads_attempted) * 100
+			summary.append(f"  • Success rate: {success_rate:.1f}%")
+		
+		summary.append("")
+		summary.append("Rate Limiting Events:")
+		summary.append(f"  • Rate limits hit: {self.rate_limits_hit}")
+		summary.append(f"  • Checkpoints encountered: {self.checkpoints_hit}")
+		summary.append(f"  • Login required events: {self.login_required_hits}")
+		
+		if self.errors:
+			summary.append("")
+			summary.append("Errors encountered:")
+			for error in self.errors[-5:]:  # Show last 5 errors
+				summary.append(f"  • {error}")
+			if len(self.errors) > 5:
+				summary.append(f"  • ... and {len(self.errors) - 5} more errors")
+		
+		summary.append("="*60)
+		return "\n".join(summary)
 
 # Global session tracker
 SESSION_TRACKER = SessionTracker()
+PROGRESS = ProgressRenderer(bar_cells=20)
 
 def resolve_log_dir(config: dict) -> str:
     """
