@@ -89,7 +89,7 @@ def wait_with_progress(label: str, seconds: float, *, win_enter_skip: bool = Fal
 		line = f"[Wait] {label} {PROGRESS._fmt_elapsed(elapsed)}/{PROGRESS._fmt_elapsed(total)} {bar}"
 		line = line[:width - 1]
 		if had_sticky:
-			sticky_line = PROGRESS.render_line()
+			sticky_line = PROGRESS.render_line_live()  # Show current item being worked on
 			# Save cursor at sticky, draw wait above, redraw sticky, restore cursor to sticky
 			sys.stdout.write("\x1b[s")  # save
 			sys.stdout.write("\x1b[1A\r" + line.ljust(width - 1))  # up to wait, write
@@ -113,7 +113,7 @@ def wait_with_progress(label: str, seconds: float, *, win_enter_skip: bool = Fal
 		SHUTDOWN.wait(min(0.5, max(0.0, remaining)))
 	actual_elapsed = time.time() - start
 	if had_sticky:
-		sticky_line = PROGRESS.render_line()
+		sticky_line = PROGRESS.render_line_live()  # Show current item being worked on
 		sys.stdout.write("\x1b[s")  # save at sticky
 		# move to wait line, write final message, back to sticky and redraw sticky
 		elapsed_fmt = PROGRESS._fmt_elapsed(actual_elapsed)
@@ -1498,9 +1498,9 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 	
 	# Check if already downloaded
 	if is_downloaded(conn, shortcode):
-		log_line(f"[SKIPPED] {shortcode} already recorded", snapshot=True)
 		SESSION_TRACKER.record_download_skip()
-		PROGRESS.on_skip()
+		PROGRESS.on_skip()  # Update progress BEFORE taking snapshot
+		log_line(f"[SKIPPED] {shortcode} already recorded", snapshot=True)
 		return True
 	
 	# Record download attempt
@@ -1526,21 +1526,24 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 		saved_path = os.path.join(download_dir, basename + ".mp4")
 		fname = os.path.basename(saved_path)
 		link_uri = to_file_uri(saved_path)
+		SESSION_TRACKER.record_download_success()
+		PROGRESS.on_success()  # Update progress BEFORE taking snapshot
 		if PROGRESS.active:
-			sticky_line = PROGRESS.render_line()
+			sticky_line = PROGRESS.render_line()  # Get snapshot with updated counts
 			PROGRESS._clear_line()
 			print(f"Successfully downloaded and recorded {fname}")
 			print(f"[LINK]  {link_uri}")
 			if sticky_line:
-				print(sticky_line)
-			PROGRESS.render()
+				print(sticky_line)  # Print checkpoint with updated progress (permanent line in scrollback)
+				sys.stdout.flush()  # Ensure snapshot is written
+			print()  # Move to new line so render() doesn't overwrite the snapshot
+			PROGRESS.render()  # Render live sticky bar on this new line
 		else:
 			print(f"Successfully downloaded and recorded {fname}")
 			print(f"[LINK]  {link_uri}")
+		# Call pacer.after_success() AFTER printing snapshot so waits don't overwrite it
 		if pacer:
 			pacer.after_success()
-		SESSION_TRACKER.record_download_success()
-		PROGRESS.on_success()
 		return True
 	
 	# Try yt-dlp first
@@ -1598,23 +1601,26 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 			status = record_download(conn, post_data, saved_path)   # pass path
 			if status == "inserted":
 				fname = os.path.basename(saved_path) if saved_path else f"{shortcode}"
+				SESSION_TRACKER.record_download_success()
+				PROGRESS.on_success()  # Update progress BEFORE taking snapshot
 				if PROGRESS.active:
-					sticky_line = PROGRESS.render_line()
+					sticky_line = PROGRESS.render_line()  # Get snapshot with updated counts
 					PROGRESS._clear_line()
 					print(f"Successfully downloaded and recorded {fname}")
 					if saved_path:
 						print(f"[LINK]  {to_file_uri(saved_path)}")
 					if sticky_line:
-						print(sticky_line)
-					PROGRESS.render()
+						print(sticky_line)  # Print checkpoint with updated progress (permanent line in scrollback)
+						sys.stdout.flush()  # Ensure snapshot is written
+					print()  # Move to new line so render() doesn't overwrite the snapshot
+					PROGRESS.render()  # Render live sticky bar on this new line
 				else:
 					print(f"Successfully downloaded and recorded {fname}")
 					if saved_path:
 						print(f"[LINK]  {to_file_uri(saved_path)}")
+				# Call pacer.after_success() AFTER printing snapshot so waits don't overwrite it
 				if pacer:
 					pacer.after_success()
-				SESSION_TRACKER.record_download_success()
-				PROGRESS.on_success()
 			elif status == "duplicate":
 				log_line(f"[DUPLICATE] {shortcode} already in database", snapshot=True)
 				SESSION_TRACKER.record_download_skip()
@@ -1707,22 +1713,26 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 			status = record_download(conn, post_data, saved_path)   # pass path
 			if status == "inserted":
 				fname = os.path.basename(saved_path) if saved_path else f"{shortcode}"
+				SESSION_TRACKER.record_download_success()
+				PROGRESS.on_success()  # Update progress BEFORE taking snapshot
 				if PROGRESS.active:
-					sticky_line = PROGRESS.render_line()
+					sticky_line = PROGRESS.render_line()  # Get snapshot with updated counts
 					PROGRESS._clear_line()
 					print(f"Successfully downloaded and recorded {fname}")
 					if saved_path:
 						print(f"[LINK]  {to_file_uri(saved_path)}")
 					if sticky_line:
-						print(sticky_line)
-					PROGRESS.render()
+						print(sticky_line)  # Print checkpoint with updated progress (permanent line in scrollback)
+						sys.stdout.flush()  # Ensure snapshot is written
+					print()  # Move to new line so render() doesn't overwrite the snapshot
+					PROGRESS.render()  # Render live sticky bar on this new line
 				else:
 					print(f"Successfully downloaded and recorded {fname}")
 					if saved_path:
 						print(f"[LINK]  {to_file_uri(saved_path)}")
+				# Call pacer.after_success() AFTER printing snapshot so waits don't overwrite it
 				if pacer:
 					pacer.after_success()
-				PROGRESS.on_success()
 			elif status == "duplicate":
 				log_line(f"[DUPLICATE] {shortcode} already in database", snapshot=True)
 				PROGRESS.on_skip()
@@ -2129,7 +2139,6 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
         bool: True if processing completed successfully
     """
     print("Processing DM downloads...")
-    PROGRESS.start(0)
     try:
         # Find message_1.json files in the inbox
         inbox_dir = os.path.join(selected_path, DM_INBOX_PATH)
@@ -2146,7 +2155,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
             print("No message files found in DM inbox")
             return False
 
-        print(f"Found {len(message_files)} DM conversations")
+        log_line(f"Found {len(message_files)} DM conversations", snapshot=False)
 
         # Display available DM conversations
         print("\nAvailable DM conversations:")
@@ -2195,8 +2204,11 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
 
         total_posts = 0
         total_profiles = 0
+        is_all_conversations = len(selected_files) > 1
+        total_conversations = len(selected_files)
+        progress_started = False
 
-        for msg_file in selected_files:
+        for conv_idx, msg_file in enumerate(selected_files, 1):
             thread_name = os.path.basename(os.path.dirname(msg_file))
             print(f"\nProcessing {thread_name}...")
 
@@ -2265,9 +2277,16 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
 
                 posts.append(post)
 
-            print(f"Found {len(posts)} shared posts from {len(part_files)} message parts")
             if posts:
+                if not progress_started:
+                    PROGRESS.start(0)
+                    progress_started = True
                 PROGRESS.add_total(len(posts))
+            # Print message - use log_line to coordinate with sticky bar and preserve in history
+            if is_all_conversations:
+                log_line(f"Found {len(posts)} shared post(s) from convo {conv_idx}/{total_conversations}", snapshot=True)
+            else:
+                log_line(f"Found {len(posts)} shared post(s)", snapshot=True)
 
             # Check for send message append option
             append_send_for_this_run = False
@@ -2280,7 +2299,6 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
             for i, post in enumerate(posts, 1):
                 if SHUTDOWN.is_set():
                     break
-                print(f"Downloading post {i}/{len(posts)}: {post['shortcode']}")
 
                 # Add send message flag to post data
                 post['append_send_for_this_run'] = append_send_for_this_run
@@ -2362,10 +2380,10 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
                                 print("[BLOCK] Manual login failed, retrying anyway...")
                         # else retry immediately
                     except NotFoundError as e:
-                        print(f"[SKIP] Post unavailable/deleted/private: {post['shortcode']}")
                         record_failure(conn, post, "Deleted/private/unavailable")
                         SESSION_TRACKER.record_download_skip()
-                        PROGRESS.on_skip()
+                        PROGRESS.on_skip()  # Update progress BEFORE taking snapshot
+                        log_line(f"[SKIP] Post unavailable/deleted/private: {post['shortcode']}", snapshot=True)
                         break
 
         if not SHUTDOWN.is_set():
@@ -2384,7 +2402,7 @@ def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 	- De-dupe by shortcode (this run)
 	- For each, if not already downloaded anywhere, call download_post(...)
 	"""
-	from db import is_downloaded  # match local-import style used elsewhere
+	from db import is_downloaded, record_failure  # match local-import style used elsewhere
 
 	liked_json = os.path.join(dump_path, LIKED_PATH)
 	if not file_exists_nonempty(liked_json):
@@ -2423,14 +2441,60 @@ def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 
 			# If any source already downloaded this shortcode, skip silently (no DB write).
 			if is_downloaded(conn, shortcode):
-				log_line(f"[SKIP] {shortcode} already downloaded")
 				SESSION_TRACKER.record_download_skip()
-				PROGRESS.on_skip()
+				PROGRESS.on_skip()  # Update progress BEFORE taking snapshot
+				log_line(f"[SKIP] {shortcode} already downloaded", snapshot=True)
 				continue
 
-			ok = download_post(conn, post, target_dir, pacer=pacer, config=config)
-			if not ok and SHUTDOWN.is_set():
-				return False
+			retry_count = 0
+			while True:
+				try:
+					ok = download_post(conn, post, target_dir, pacer, config)
+					if ok and pacer:
+						pacer.after_success()
+					break
+
+				except RateLimitError:
+					SESSION_TRACKER.record_rate_limit()
+					base_delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE) - 1)]
+					delay = get_jittered_delay(base_delay)
+					print(f"[BLOCK] Rate limited. Retrying in {delay}s.")
+					if wait_with_progress("Rate limit", delay):
+						return False
+					retry_count += 1
+
+				except CheckpointError:
+					print("[BLOCK] Checkpoint/challenge. Use manual login then retry.")
+					resp = input("[Enter]=retry  |  M=manual login  |  S=skip  |  Q=quit > ").strip().lower()
+					if resp == "q": return False
+					if resp == "s":
+						record_failure(conn, post, "Skipped during checkpoint")
+						break
+					if resp == "m":
+						# Re-run your existing manual-login path
+						config = read_config()
+						profile_dir, cookie_file = resolve_profile_and_cookie(config)
+						manual_login_and_export_cookies(profile_dir, cookie_file)
+					# else retry
+
+				except LoginRequiredError:
+					print("[BLOCK] Login required. Revalidate cookies.")
+					resp = input("[M]=manual login  |  R=retry  |  S=skip  |  Q=quit > ").strip().lower()
+					if resp == "q": return False
+					if resp == "s":
+						record_failure(conn, post, "Skipped after login-required")
+						break
+					if resp == "m":
+						config = read_config()
+						profile_dir, cookie_file = resolve_profile_and_cookie(config)
+						manual_login_and_export_cookies(profile_dir, cookie_file)
+
+				except NotFoundError:
+					record_failure(conn, post, "Deleted/private/unavailable")
+					SESSION_TRACKER.record_download_skip()
+					PROGRESS.on_skip()  # Update progress BEFORE taking snapshot
+					log_line(f"[SKIP] Unavailable/deleted/private: {shortcode}", snapshot=True)
+					break
 
 		print("Liked posts processing complete.")
 		return True
@@ -2464,20 +2528,21 @@ def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 		print("No saved posts found.")
 		return True
 
+	print(f"Found {len(all_posts)} saved post(s). Starting downloads...")
 	download_base_dir = config.get("DOWNLOAD_DIRECTORY", os.path.join(os.path.dirname(__file__), "downloads"))
 	PROGRESS.start(len(all_posts))
 	try:
 		for i, post in enumerate(all_posts, 1):
 			if SHUTDOWN.is_set():
 				print("[STOP] Cancelled by user.")
-				break
+				return False
 
 			shortcode = post["shortcode"]
 			# Skip re-downloads if any source already succeeded for this shortcode
 			if is_downloaded(conn, shortcode):
-				log_line(f"[SKIP] Already downloaded {shortcode}", snapshot=True)
 				SESSION_TRACKER.record_download_skip()
-				PROGRESS.on_skip()
+				PROGRESS.on_skip()  # Update progress BEFORE taking snapshot
+				log_line(f"[SKIP] Already downloaded {shortcode}", snapshot=True)
 				continue
 
 			# Resolve target dir per collection
@@ -2528,10 +2593,10 @@ def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 						manual_login_and_export_cookies(profile_dir, cookie_file)
 
 				except NotFoundError:
-					log_line(f"[SKIP] Unavailable/deleted/private: {shortcode}", snapshot=True)
 					record_failure(conn, post, "Deleted/private/unavailable")
 					SESSION_TRACKER.record_download_skip()
-					PROGRESS.on_skip()
+					PROGRESS.on_skip()  # Update progress BEFORE taking snapshot
+					log_line(f"[SKIP] Unavailable/deleted/private: {shortcode}", snapshot=True)
 					break
 		return True
 	finally:
@@ -3039,31 +3104,56 @@ class ProgressRenderer:
 			self.render()
 
 	def render(self):
+		"""Render the live sticky bar showing current item being worked on (done + 1)."""
 		if not self.active:
 			return
 		width = shutil.get_terminal_size((100, 20)).columns
 		done = self.success + self.failure + self.skipped
 		total = self.total if self.total > 0 else 0
-		percent = (done / total * 100) if total else 0.0
-		bar = self._bar(done, total)
+		# Show current item being worked on (done + 1), always at least 1, capped at total
+		current = max(1, done + 1)  # Always show at least item 1
+		if total > 0:
+			current = min(current, total)  # Cap at total if we know it
+		percent = (current / total * 100) if total else 0.0
+		bar = self._bar(current, total)
 		elapsed = self._fmt_elapsed(time.time() - self.start_ts)
 		total_display = str(self.total) if self.total > 0 else "?"
-		line = f"[Overall] {done}/{total_display} ({percent:.1f}%) {bar}  Elapsed {elapsed}  OK:{self.success} Fail:{self.failure} Skip:{self.skipped}"
+		line = f"[Overall] {current}/{total_display} ({percent:.1f}%) {bar}  Elapsed {elapsed}  OK:{self.success} Fail:{self.failure} Skip:{self.skipped}"
 		line = line[:width - 1]
 		print("\r" + line.ljust(width - 1), end='', flush=True)
 
 	def render_line(self) -> str:
-		"""Return the current sticky line text (without newline)."""
+		"""Return the sticky line text showing completed items (for snapshots, without newline)."""
 		if not self.active:
 			return ""
 		width = shutil.get_terminal_size((100, 20)).columns
 		done = self.success + self.failure + self.skipped
 		total = self.total if self.total > 0 else 0
-		percent = (done / total * 100) if total else 0.0
-		bar = self._bar(done, total)
+		# For snapshots: show completed items, but always at least 1 when done=0 to indicate we're working on item 1
+		display_count = 1 if done == 0 else done
+		percent = (display_count / total * 100) if total else 0.0
+		bar = self._bar(display_count, total)
 		elapsed = self._fmt_elapsed(time.time() - self.start_ts)
 		total_display = str(self.total) if self.total > 0 else "?"
-		line = f"[Overall] {done}/{total_display} ({percent:.1f}%) {bar}  Elapsed {elapsed}  OK:{self.success} Fail:{self.failure} Skip:{self.skipped}"
+		line = f"[Overall] {display_count}/{total_display} ({percent:.1f}%) {bar}  Elapsed {elapsed}  OK:{self.success} Fail:{self.failure} Skip:{self.skipped}"
+		return line[:width - 1].ljust(width - 1)
+
+	def render_line_live(self) -> str:
+		"""Return the sticky line text showing current item being worked on (done + 1, for live bar)."""
+		if not self.active:
+			return ""
+		width = shutil.get_terminal_size((100, 20)).columns
+		done = self.success + self.failure + self.skipped
+		total = self.total if self.total > 0 else 0
+		# Show current item being worked on (done + 1), always at least 1, capped at total
+		current = max(1, done + 1)  # Always show at least item 1
+		if total > 0:
+			current = min(current, total)  # Cap at total if we know it
+		percent = (current / total * 100) if total else 0.0
+		bar = self._bar(current, total)  # Show current item for live bar
+		elapsed = self._fmt_elapsed(time.time() - self.start_ts)
+		total_display = str(self.total) if self.total > 0 else "?"
+		line = f"[Overall] {current}/{total_display} ({percent:.1f}%) {bar}  Elapsed {elapsed}  OK:{self.success} Fail:{self.failure} Skip:{self.skipped}"
 		return line[:width - 1].ljust(width - 1)
 
 	def _bar(self, done: int, total: int) -> str:
@@ -3183,8 +3273,10 @@ def log_line(msg: str, *, snapshot: bool = False):
 		PROGRESS._clear_line()
 		print(msg)
 		if snapshot and sticky_line:
-			print(sticky_line)
-		PROGRESS.render()
+			print(sticky_line)  # Print snapshot (permanent line in scrollback)
+			sys.stdout.flush()  # Ensure snapshot is written
+			print()  # Move to new line so render() doesn't overwrite the snapshot
+		PROGRESS.render()  # Render live sticky bar on this new line
 	else:
 		print(msg)
 
