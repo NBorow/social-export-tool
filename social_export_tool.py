@@ -1476,6 +1476,20 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 	
 	print(f"Downloading {shortcode}...")
 	
+	# Dry-run mode: simulate success without actual download
+	dry_run = parse_bool(config.get("DRY_RUN", "false"), False) if config else False
+	if dry_run:
+		# Simulate successful download
+		# Generate a fake path for display purposes
+		saved_path = os.path.join(download_dir, basename + ".mp4")
+		fname = os.path.basename(saved_path)
+		print(f"Successfully downloaded and recorded {fname}")
+		print(f"[LINK]  {to_file_uri(saved_path)}")
+		if pacer:
+			pacer.after_success()
+		SESSION_TRACKER.record_download_success()
+		return True
+	
 	# Try yt-dlp first
 	try:
 		cmd = [
@@ -2441,6 +2455,7 @@ def read_config():
     
     # Set defaults for optional config keys
     config.setdefault("APPEND_POST_DATE", "false")
+    config.setdefault("DRY_RUN", "false")
     
     return config
 
@@ -2656,6 +2671,12 @@ def main():
     # (optional) echo where failures will be recorded
     print(f"[LOG] Failures will append to: {FAIL_LOG_PATH}")
     
+    # Check for dry-run mode
+    dry_run = parse_bool(config.get("DRY_RUN", "false"), False)
+    if dry_run:
+        print("\n[DRY RUN MODE] Active - No files will be downloaded, no database writes\n")
+    SESSION_TRACKER.set_dry_run(dry_run)
+    
     # --- Pre-flight ffmpeg check ---
     if not check_ffmpeg_availability():
         print_ffmpeg_warning()
@@ -2869,6 +2890,10 @@ class SessionTracker:
         self.checkpoints_hit = 0
         self.login_required_hits = 0
         self.errors = []
+        self.dry_run = False
+    
+    def set_dry_run(self, value: bool):
+        self.dry_run = value
     
     def record_download_attempt(self):
         self.downloads_attempted += 1
@@ -2904,6 +2929,8 @@ class SessionTracker:
         summary = []
         summary.append("\n" + "="*60)
         summary.append("📊 SESSION SUMMARY")
+        if self.dry_run:
+            summary.append("⚠️  DRY RUN MODE - No files downloaded, no database writes")
         summary.append("="*60)
         summary.append(f"Session duration: {hours:02d}:{minutes:02d}:{seconds:02d}")
         summary.append("")
