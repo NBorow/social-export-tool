@@ -1498,7 +1498,7 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 	
 	# Check if already downloaded
 	if is_downloaded(conn, shortcode):
-		print(f"[SKIPPED] {shortcode} already recorded")
+		log_line(f"[SKIPPED] {shortcode} already recorded", snapshot=True)
 		SESSION_TRACKER.record_download_skip()
 		PROGRESS.on_skip()
 		return True
@@ -1516,7 +1516,7 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 	filename_template = basename + ".%(ext)s"
 	output_path = os.path.join(download_dir, filename_template)
 	
-	print(f"Downloading {shortcode}...")
+	log_line(f"Downloading {shortcode}...", snapshot=False)
 	
 	# Dry-run mode: simulate success without actual download
 	dry_run = parse_bool(config.get("DRY_RUN", "false"), False) if config else False
@@ -1525,8 +1525,18 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 		# Generate a fake path for display purposes
 		saved_path = os.path.join(download_dir, basename + ".mp4")
 		fname = os.path.basename(saved_path)
-		print(f"Successfully downloaded and recorded {fname}")
-		print(f"[LINK]  {to_file_uri(saved_path)}")
+		link_uri = to_file_uri(saved_path)
+		if PROGRESS.active:
+			sticky_line = PROGRESS.render_line()
+			PROGRESS._clear_line()
+			print(f"Successfully downloaded and recorded {fname}")
+			print(f"[LINK]  {link_uri}")
+			if sticky_line:
+				print(sticky_line)
+			PROGRESS.render()
+		else:
+			print(f"Successfully downloaded and recorded {fname}")
+			print(f"[LINK]  {link_uri}")
 		if pacer:
 			pacer.after_success()
 		SESSION_TRACKER.record_download_success()
@@ -1588,29 +1598,39 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 			status = record_download(conn, post_data, saved_path)   # pass path
 			if status == "inserted":
 				fname = os.path.basename(saved_path) if saved_path else f"{shortcode}"
-				print(f"Successfully downloaded and recorded {fname}")
-				if saved_path:
-					print(f"[LINK]  {to_file_uri(saved_path)}")
+				if PROGRESS.active:
+					sticky_line = PROGRESS.render_line()
+					PROGRESS._clear_line()
+					print(f"Successfully downloaded and recorded {fname}")
+					if saved_path:
+						print(f"[LINK]  {to_file_uri(saved_path)}")
+					if sticky_line:
+						print(sticky_line)
+					PROGRESS.render()
+				else:
+					print(f"Successfully downloaded and recorded {fname}")
+					if saved_path:
+						print(f"[LINK]  {to_file_uri(saved_path)}")
 				if pacer:
 					pacer.after_success()
 				SESSION_TRACKER.record_download_success()
 				PROGRESS.on_success()
 			elif status == "duplicate":
-				print(f"[DUPLICATE] {shortcode} already in database")
+				log_line(f"[DUPLICATE] {shortcode} already in database", snapshot=True)
 				SESSION_TRACKER.record_download_skip()
 				PROGRESS.on_skip()
 			else:
-				print(f"[ERROR] {shortcode} → database error")
+				log_line(f"[ERROR] {shortcode} → database error", snapshot=True)
 				SESSION_TRACKER.record_error(f"Database error for {shortcode}")
 				PROGRESS.on_failure()
 			return True
 		else:
-			print(f"yt-dlp failed for {shortcode}: {result.stderr}")
+			log_line(f"yt-dlp failed for {shortcode}: {result.stderr}", snapshot=False)
 			
 	except subprocess.TimeoutExpired:
-		print(f"yt-dlp timeout for {shortcode}")
+		log_line(f"yt-dlp timeout for {shortcode}", snapshot=False)
 	except Exception as e:
-		print(f"yt-dlp error for {shortcode}: {e}")
+		log_line(f"yt-dlp error for {shortcode}: {e}", snapshot=False)
     
 	# Fallback to gallery-dl
 	try:
@@ -1687,39 +1707,49 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 			status = record_download(conn, post_data, saved_path)   # pass path
 			if status == "inserted":
 				fname = os.path.basename(saved_path) if saved_path else f"{shortcode}"
-				print(f"Successfully downloaded and recorded {fname}")
-				if saved_path:
-					print(f"[LINK]  {to_file_uri(saved_path)}")
+				if PROGRESS.active:
+					sticky_line = PROGRESS.render_line()
+					PROGRESS._clear_line()
+					print(f"Successfully downloaded and recorded {fname}")
+					if saved_path:
+						print(f"[LINK]  {to_file_uri(saved_path)}")
+					if sticky_line:
+						print(sticky_line)
+					PROGRESS.render()
+				else:
+					print(f"Successfully downloaded and recorded {fname}")
+					if saved_path:
+						print(f"[LINK]  {to_file_uri(saved_path)}")
 				if pacer:
 					pacer.after_success()
 				PROGRESS.on_success()
 			elif status == "duplicate":
-				print(f"[DUPLICATE] {shortcode} already in database")
+				log_line(f"[DUPLICATE] {shortcode} already in database", snapshot=True)
 				PROGRESS.on_skip()
 			else:
-				print(f"[ERROR] {shortcode} → database error")
+				log_line(f"[ERROR] {shortcode} → database error", snapshot=True)
 				PROGRESS.on_failure()
 			return True
 		else:
-			print(f"gallery-dl failed for {shortcode}: {result.stderr}")
+			log_line(f"gallery-dl failed for {shortcode}: {result.stderr}", snapshot=False)
 			
 	except subprocess.TimeoutExpired:
-		print(f"gallery-dl timeout for {shortcode}")
+		log_line(f"gallery-dl timeout for {shortcode}", snapshot=False)
 	except Exception as e:
-		print(f"gallery-dl error for {shortcode}: {e}")
+		log_line(f"gallery-dl error for {shortcode}: {e}", snapshot=False)
     
 	# Record failure
 	error_msg = f"Both yt-dlp and gallery-dl failed to download {shortcode}"
 	status = record_failure(conn, post_data, error_msg)
 	if status == "inserted":
-		print(f"[ERROR] {shortcode} → {error_msg}")
+		log_line(f"[ERROR] {shortcode} → {error_msg}", snapshot=True)
 		SESSION_TRACKER.record_download_failure()
 		SESSION_TRACKER.record_error(f"Download failed: {shortcode} - {error_msg}")
 		PROGRESS.on_failure()
 	elif status == "duplicate":
 		print(f"[DUPLICATE] {shortcode} failure already recorded")
 	else:
-		print(f"[ERROR] {shortcode} → database error recording failure")
+		log_line(f"[ERROR] {shortcode} → database error recording failure", snapshot=True)
 		SESSION_TRACKER.record_error(f"Database error recording failure for {shortcode}")
 		PROGRESS.on_failure()
 	
@@ -1966,7 +1996,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
             
             # Check if already downloaded
             if is_downloaded(conn, shortcode):
-                print(f"[SKIP] {shortcode} already downloaded for @{username}")
+                log_line(f"[SKIP] {shortcode} already downloaded for @{username}", snapshot=True)
                 skipped_count += 1
                 continue
             
@@ -2393,7 +2423,7 @@ def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 
 			# If any source already downloaded this shortcode, skip silently (no DB write).
 			if is_downloaded(conn, shortcode):
-				print(f"[SKIP] {shortcode} already downloaded")
+				log_line(f"[SKIP] {shortcode} already downloaded")
 				SESSION_TRACKER.record_download_skip()
 				PROGRESS.on_skip()
 				continue
@@ -2445,7 +2475,7 @@ def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 			shortcode = post["shortcode"]
 			# Skip re-downloads if any source already succeeded for this shortcode
 			if is_downloaded(conn, shortcode):
-				print(f"[SKIP] Already downloaded {shortcode}")
+				log_line(f"[SKIP] Already downloaded {shortcode}", snapshot=True)
 				SESSION_TRACKER.record_download_skip()
 				PROGRESS.on_skip()
 				continue
@@ -2498,7 +2528,7 @@ def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 						manual_login_and_export_cookies(profile_dir, cookie_file)
 
 				except NotFoundError:
-					print(f"[SKIP] Unavailable/deleted/private: {shortcode}")
+					log_line(f"[SKIP] Unavailable/deleted/private: {shortcode}", snapshot=True)
 					record_failure(conn, post, "Deleted/private/unavailable")
 					SESSION_TRACKER.record_download_skip()
 					PROGRESS.on_skip()
@@ -3142,6 +3172,21 @@ class SessionTracker:
 # Global session tracker
 SESSION_TRACKER = SessionTracker()
 PROGRESS = ProgressRenderer(bar_cells=20)
+
+def log_line(msg: str, *, snapshot: bool = False):
+	"""
+	Print a line without disturbing the sticky progress bar.
+	If snapshot is True, also emit the current sticky line into history.
+	"""
+	if PROGRESS.active:
+		sticky_line = PROGRESS.render_line()
+		PROGRESS._clear_line()
+		print(msg)
+		if snapshot and sticky_line:
+			print(sticky_line)
+		PROGRESS.render()
+	else:
+		print(msg)
 
 def resolve_log_dir(config: dict) -> str:
     """
