@@ -25,6 +25,12 @@ from webdriver_manager.chrome import ChromeDriverManager
 import requests
 import atexit
 
+# Optional Pushbullet support
+try:
+	from pushbullet import Pushbullet
+except ImportError:
+	Pushbullet = None  # type: ignore
+
 # Import database functions
 from db import init_db, is_downloaded, get_post, record_download, record_failure, get_download_stats, close_db, get_recent_download_timestamps
 
@@ -2126,7 +2132,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
         print(f"[ERROR] Profile @{username} - {e}")
         return False
 
-def process_dm_download(conn, selected_path, pacer=None, safety_config=None, config=None):
+def process_dm_download(conn, selected_path, pacer=None, safety_config=None, config=None, notifier=None):
     """
     Process DM downloads from a selected profile dump.
     
@@ -2331,6 +2337,12 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
                                 return False  # Shutdown requested
                             retry_count += 1
                             continue
+                        if notifier is not None:
+                            short = post.get("shortcode") or post.get("url") or "unknown"
+                            notifier(
+                                "Instagram Export – Attention Required",
+                                f"Manual decision required (rate_limit) for {short}. Attach to tmux and respond."
+                            )
                         resp = input("[Enter]=retry now  |  D=delayed exponential retry  |  S=skip this item  |  Q=quit run > ").strip().lower()
                         if resp == "q":
                             return False
@@ -2346,6 +2358,12 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
                         print(f"\n[BLOCK] Checkpoint/challenge.")
                         print("[Advice] Complete MANUAL LOGIN with the same persistent profile (or wait/switch), then retry.")
                         print("[Advice] After clearing the challenge, waiting ~30–60 minutes before resuming is safest.")
+                        if notifier is not None:
+                            short = post.get("shortcode") or post.get("url") or "unknown"
+                            notifier(
+                                "Instagram Export – Attention Required",
+                                f"Manual decision required (checkpoint) for {short}. Attach to tmux and respond."
+                            )
                         resp = input("[Enter]=retry  |  M=manual login now  |  S=skip  |  Q=quit > ").strip().lower()
                         if resp == "q":
                             return False
@@ -2364,6 +2382,12 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
                     except LoginRequiredError as e:
                         print(f"\n[BLOCK] Login required (cookies/session invalid).")
                         print("[Advice] Revalidate cookies via MANUAL LOGIN, then retry.")
+                        if notifier is not None:
+                            short = post.get("shortcode") or post.get("url") or "unknown"
+                            notifier(
+                                "Instagram Export – Attention Required",
+                                f"Manual decision required (login_required) for {short}. Attach to tmux and respond."
+                            )
                         resp = input("[M]=manual login now  |  R=retry with current cookies  |  S=skip  |  Q=quit > ").strip().lower()
                         if resp == "q":
                             return False
@@ -2390,12 +2414,22 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
             print(f"\nDM download complete!")
             print(f"Total posts downloaded: {total_posts}")
             print(f"Total profiles processed: {total_profiles}")
-
+            if notifier is not None:
+                summary = (
+                    f"DM run complete. "
+                    f"Posts: {total_posts}, "
+                    f"Profiles: {total_profiles}, "
+                    f"Attempted: {SESSION_TRACKER.downloads_attempted}, "
+                    f"OK: {SESSION_TRACKER.downloads_successful}, "
+                    f"Failed: {SESSION_TRACKER.downloads_failed}, "
+                    f"Skipped: {SESSION_TRACKER.downloads_skipped}"
+                )
+                notifier("Instagram Export – DMs", summary)
             return True
     finally:
         PROGRESS.finish()
 
-def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, config: dict):
+def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, config: dict, notifier=None):
 	"""
 	Process liked posts inside a specific profile dump directory.
 	- Parse JSON
@@ -2465,6 +2499,12 @@ def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 
 				except CheckpointError:
 					print("[BLOCK] Checkpoint/challenge. Use manual login then retry.")
+					if notifier is not None:
+						short = post.get("shortcode") or post.get("url") or "unknown"
+						notifier(
+							"Instagram Export – Attention Required",
+							f"Manual decision required (checkpoint) for {short}. Attach to tmux and respond."
+						)
 					resp = input("[Enter]=retry  |  M=manual login  |  S=skip  |  Q=quit > ").strip().lower()
 					if resp == "q": return False
 					if resp == "s":
@@ -2479,6 +2519,12 @@ def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 
 				except LoginRequiredError:
 					print("[BLOCK] Login required. Revalidate cookies.")
+					if notifier is not None:
+						short = post.get("shortcode") or post.get("url") or "unknown"
+						notifier(
+							"Instagram Export – Attention Required",
+							f"Manual decision required (login_required) for {short}. Attach to tmux and respond."
+						)
 					resp = input("[M]=manual login  |  R=retry  |  S=skip  |  Q=quit > ").strip().lower()
 					if resp == "q": return False
 					if resp == "s":
@@ -2497,11 +2543,20 @@ def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 					break
 
 		print("Liked posts processing complete.")
+		if notifier is not None:
+			summary = (
+				f"Liked posts run complete. "
+				f"Attempted: {SESSION_TRACKER.downloads_attempted}, "
+				f"OK: {SESSION_TRACKER.downloads_successful}, "
+				f"Failed: {SESSION_TRACKER.downloads_failed}, "
+				f"Skipped: {SESSION_TRACKER.downloads_skipped}"
+			)
+			notifier("Instagram Export – Liked Posts", summary)
 		return True
 	finally:
 		PROGRESS.finish()
 
-def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, config: dict):
+def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, config: dict, notifier=None):
 	"""
 	Process Saved posts found inside a profile export dump.
 	- Parse saved_posts.json and saved_collections.json
@@ -2568,6 +2623,12 @@ def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 
 				except CheckpointError:
 					print("[BLOCK] Checkpoint/challenge. Use manual login then retry.")
+					if notifier is not None:
+						short = post.get("shortcode") or post.get("url") or "unknown"
+						notifier(
+							"Instagram Export – Attention Required",
+							f"Manual decision required (checkpoint) for {short}. Attach to tmux and respond."
+						)
 					resp = input("[Enter]=retry  |  M=manual login  |  S=skip  |  Q=quit > ").strip().lower()
 					if resp == "q": return False
 					if resp == "s":
@@ -2582,6 +2643,12 @@ def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 
 				except LoginRequiredError:
 					print("[BLOCK] Login required. Revalidate cookies.")
+					if notifier is not None:
+						short = post.get("shortcode") or post.get("url") or "unknown"
+						notifier(
+							"Instagram Export – Attention Required",
+							f"Manual decision required (login_required) for {short}. Attach to tmux and respond."
+						)
 					resp = input("[M]=manual login  |  R=retry  |  S=skip  |  Q=quit > ").strip().lower()
 					if resp == "q": return False
 					if resp == "s":
@@ -2598,6 +2665,15 @@ def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 					PROGRESS.on_skip()  # Update progress BEFORE taking snapshot
 					log_line(f"[SKIP] Unavailable/deleted/private: {shortcode}", snapshot=True)
 					break
+		if notifier is not None:
+			summary = (
+				f"Saved posts run complete. "
+				f"Attempted: {SESSION_TRACKER.downloads_attempted}, "
+				f"OK: {SESSION_TRACKER.downloads_successful}, "
+				f"Failed: {SESSION_TRACKER.downloads_failed}, "
+				f"Skipped: {SESSION_TRACKER.downloads_skipped}"
+			)
+			notifier("Instagram Export – Saved Posts", summary)
 		return True
 	finally:
 		PROGRESS.finish()
@@ -2822,6 +2898,9 @@ def settings_menu():
 def main():
     config = read_config()
     
+    # Initialize Pushbullet notifier if configured
+    notifier = _make_notifier(config)
+    
     # Install signal handlers early
     install_signal_handlers()
     
@@ -2909,7 +2988,7 @@ def main():
                                 
                                 # Handle different download options
                                 if "DM Download" in selected_option:
-                                    result = process_dm_download(conn, selected_path, pacer, safety_config, config)
+                                    result = process_dm_download(conn, selected_path, pacer, safety_config, config, notifier)
                                     if result is True:
                                         # Print download statistics only if completed
                                         print("\nDownload Statistics:")
@@ -2930,7 +3009,7 @@ def main():
                                     input("Press Enter to return to main menu...")
                                     break
                                 elif "Liked Posts Download" in selected_option:
-                                    result = process_liked_for_dump(conn, selected_path, pacer, safety_config, config)
+                                    result = process_liked_for_dump(conn, selected_path, pacer, safety_config, config, notifier)
                                     if result is True:
                                         print("\nDownload Statistics:")
                                         stats = get_download_stats(conn)
@@ -2945,7 +3024,7 @@ def main():
                                         input("Press Enter to return to main menu...")
                                         break
                                 elif "Saved Posts Download" in selected_option:
-                                    result = process_saved_for_dump(conn, selected_path, pacer, safety_config, config)
+                                    result = process_saved_for_dump(conn, selected_path, pacer, safety_config, config, notifier)
                                     if result is True:
                                         print("\nDownload Statistics:")
                                         stats = get_download_stats(conn)
@@ -3279,6 +3358,42 @@ def log_line(msg: str, *, snapshot: bool = False):
 		PROGRESS.render()  # Render live sticky bar on this new line
 	else:
 		print(msg)
+
+# --- Push notifications (optional) ---
+def _load_pushbullet_token(config: dict) -> str | None:
+	"""
+	Return a Pushbullet API token if configured; otherwise None.
+	Reads PUSHBULLET_TOKEN from config.txt.
+	"""
+	token = (config.get("PUSHBULLET_TOKEN") or "").strip()
+	return token or None
+
+def _make_notifier(config: dict):
+	"""
+	Initialize a Pushbullet client if possible, otherwise return
+	a no-op notify(title, body) function.
+	"""
+	token = _load_pushbullet_token(config)
+	if not token or Pushbullet is None:
+		def _noop_notify(title: str, body: str) -> None:
+			return
+		return _noop_notify
+
+	try:
+		pb = Pushbullet(token)
+	except Exception:
+		def _noop_notify(title: str, body: str) -> None:
+			return
+		return _noop_notify
+
+	def _notify(title: str, body: str) -> None:
+		try:
+			pb.push_note(title, body)
+		except Exception:
+			# Notification failures should never crash the downloader
+			pass
+
+	return _notify
 
 def resolve_log_dir(config: dict) -> str:
     """
