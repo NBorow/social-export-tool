@@ -375,20 +375,26 @@ def resolve_profile_and_cookie(config):
 # --- New: Profile dump scan logic ---
 PROFILE_POSTS_PATH = os.path.join('your_instagram_activity', 'media', 'posts_1.json')
 LIKED_PATH = os.path.join('your_instagram_activity', 'likes', 'liked_posts.json')
+REPOSTS_PATH = os.path.join('your_instagram_activity', 'media', 'reposts.json')
 SAVED_COLLECTIONS_PATH = os.path.join('your_instagram_activity', 'saved', 'saved_collections.json')
 SAVED_POSTS_PATH = os.path.join('your_instagram_activity', 'saved', 'saved_posts.json')
 DM_INBOX_PATH = os.path.join('your_instagram_activity', 'messages', 'inbox')
+
+JANSON_REPOSTS_COLLECTION   = 'JansonReposts'
+JANSON_REPOSTS_DEFUNCT      = 'JansonRepostsDefunct'
+JANSONHORTUY_USERNAME       = 'jansonhortuy'
 
 # Target base subfolder for saved downloads
 SAVED_BASE_SUBDIR = "saved"
 UNSORTED_COLLECTION_DIRNAME = "_unsorted"
 
-# Priority: lower number = wins. Named collections beat unsorted saved, which beats DMs, which beat liked.
+# Priority: lower number = wins.
 _SOURCE_EFFECTIVE_PRIORITY: dict[tuple[str, bool], int] = {
-    ("saved", False): 0,  # saved + named collection
-    ("saved", True):  1,  # saved + _unsorted
-    ("dm",    False): 2,
-    ("liked", False): 3,
+    ("saved",    False): 0,  # saved + named collection
+    ("reposts",  False): 1,
+    ("saved",    True):  2,  # saved + _unsorted
+    ("dm",       False): 3,
+    ("liked",    False): 4,
 }
 
 def _source_priority(source: str, collection: str | None) -> int:
@@ -565,13 +571,16 @@ def file_exists_nonempty(path):
     return os.path.isfile(path) and os.path.getsize(path) > 0
 
 def scan_profile_dump(dump_path):
-    result = {'p': False, 'l': False, 's': False, 'd': False}
+    result = {'p': False, 'l': False, 'r': False, 's': False, 'd': False}
     posts_json = os.path.join(dump_path, PROFILE_POSTS_PATH)
     if file_exists_nonempty(posts_json):
         result['p'] = True
     liked_json = os.path.join(dump_path, LIKED_PATH)
     if file_exists_nonempty(liked_json):
         result['l'] = True
+    reposts_json = os.path.join(dump_path, REPOSTS_PATH)
+    if file_exists_nonempty(reposts_json):
+        result['r'] = True
     saved_collections_json = os.path.join(dump_path, SAVED_COLLECTIONS_PATH)
     saved_posts_json = os.path.join(dump_path, SAVED_POSTS_PATH)
     if file_exists_nonempty(saved_collections_json) or file_exists_nonempty(saved_posts_json):
@@ -1197,8 +1206,9 @@ def extract_shortcode_from_url(url):
 
 def parse_liked_posts_json(liked_json_path: str) -> list[dict]:
 	"""
-	Parse Instagram 'liked_posts.json' (your_instagram_activity/likes/liked_posts.json).
-	Returns a list of unified post dicts expected by download_post(...).
+	Parse Instagram 'liked_posts.json'. Handles two export formats:
+	  Old: {"likes_media_likes": [{"title": username, "string_list_data": [{"href": url, "timestamp": ts}]}]}
+	  New: [{"timestamp": ts, "label_values": [{"label":"URL","href":url}, ..., {"title":"Owner","dict":[...]}]}]
 	"""
 	posts: list[dict] = []
 	if not file_exists_nonempty(liked_json_path):
@@ -1206,41 +1216,131 @@ def parse_liked_posts_json(liked_json_path: str) -> list[dict]:
 
 	try:
 		with open(liked_json_path, 'r', encoding='utf-8') as f:
-			data = json.load(f) or {}
+			data = json.load(f)
 
-		items = (data.get('likes_media_likes') or [])
 		seen = set()
 
-		for it in items:
-			title = (it.get('title') or '').strip()
-			sld = (it.get('string_list_data') or [])
-			if not sld:
-				continue
-			entry = sld[0] or {}
-			href = (entry.get('href') or '').strip()
-			ts = entry.get('timestamp') or 0
+		# New format: top-level list with label_values
+		if isinstance(data, list):
+			for it in data:
+				lv = {e['label']: e for e in (it.get('label_values') or []) if e.get('label')}
+				url_entry = lv.get('URL') or {}
+				href = (url_entry.get('href') or url_entry.get('value') or '').strip()
+				ts = it.get('timestamp') or 0
 
-			shortcode = extract_shortcode_from_url(href)
-			if not shortcode:
-				continue
-			if shortcode in seen:
-				continue
-			seen.add(shortcode)
+				# username lives under the "Owner" label_values entry (has 'title' not 'label')
+				username = None
+				for e in (it.get('label_values') or []):
+					if e.get('title') == 'Owner':
+						for owner_item in (e.get('dict') or []):
+							for kv in (owner_item.get('dict') or []):
+								if kv.get('label') == 'Username':
+									username = kv.get('value')
+									break
 
-			posts.append({
-				'shortcode': shortcode,
-				'url': href,
-				'original_owner': title,
-				'username': title,
-				'description': '',
-				'timestamp_ms': int(ts) * 1000 if ts else 0,
-				'source': 'liked',
-				'dm_thread': None,
-			})
+				shortcode = extract_shortcode_from_url(href)
+				if not shortcode or shortcode in seen:
+					continue
+				seen.add(shortcode)
+				posts.append({
+					'shortcode': shortcode,
+					'url': href,
+					'original_owner': username,
+					'username': username,
+					'description': '',
+					'timestamp_ms': int(ts) * 1000 if ts else 0,
+					'source': 'liked',
+					'dm_thread': None,
+				})
+
+		# Old format: {"likes_media_likes": [...]}
+		else:
+			for it in (data.get('likes_media_likes') or []):
+				title = (it.get('title') or '').strip()
+				sld = (it.get('string_list_data') or [])
+				if not sld:
+					continue
+				entry = sld[0] or {}
+				href = (entry.get('href') or '').strip()
+				ts = entry.get('timestamp') or 0
+
+				shortcode = extract_shortcode_from_url(href)
+				if not shortcode or shortcode in seen:
+					continue
+				seen.add(shortcode)
+				posts.append({
+					'shortcode': shortcode,
+					'url': href,
+					'original_owner': title,
+					'username': title,
+					'description': '',
+					'timestamp_ms': int(ts) * 1000 if ts else 0,
+					'source': 'liked',
+					'dm_thread': None,
+				})
+
 	except Exception as e:
 		print(f"Failed to parse liked posts JSON: {e}")
 
 	return posts
+
+def _dump_username(dump_path: str) -> str:
+	"""Extract Instagram username from dump folder (instagram-<username>-<date>-<hash>)."""
+	folder = os.path.basename(os.path.normpath(dump_path))
+	parts = folder.split('-', 2)
+	return parts[1] if len(parts) >= 2 else ''
+
+
+def parse_reposts_json(reposts_json_path: str) -> list[dict]:
+	"""
+	Parse Instagram 'reposts.json' (your_instagram_activity/media/reposts.json).
+	Format: top-level list; URL/owner nested under label_values → title=="Media" → dict[0]["dict"].
+	"""
+	posts: list[dict] = []
+	if not file_exists_nonempty(reposts_json_path):
+		return posts
+	try:
+		with open(reposts_json_path, 'r', encoding='utf-8') as f:
+			data = json.load(f)
+		if not isinstance(data, list):
+			return posts
+		seen: set[str] = set()
+		for it in data:
+			ts = it.get('timestamp') or 0
+			href = None
+			username = None
+			for lv in (it.get('label_values') or []):
+				if lv.get('title') == 'Media':
+					inner = ((lv.get('dict') or [{}])[0]).get('dict') or []
+					for entry in inner:
+						if entry.get('label') == 'URL' and not href:
+							href = (entry.get('href') or entry.get('value') or '').strip()
+						if entry.get('title') == 'Owner':
+							for owner_item in (entry.get('dict') or []):
+								for kv in (owner_item.get('dict') or []):
+									if kv.get('label') == 'Username':
+										username = kv.get('value')
+					break
+			if not href:
+				continue
+			shortcode = extract_shortcode_from_url(href)
+			if not shortcode or shortcode in seen:
+				continue
+			seen.add(shortcode)
+			posts.append({
+				'shortcode': shortcode,
+				'url': href,
+				'original_owner': username,
+				'username': username,
+				'description': '',
+				'timestamp_ms': int(ts) * 1000 if ts else 0,
+				'source': 'reposts',
+				'dm_thread': None,
+			})
+	except Exception as e:
+		print(f"Failed to parse reposts JSON: {e}")
+	return posts
+
 
 def parse_saved_posts_json(saved_json_path: str) -> list[dict]:
 	"""
@@ -2655,6 +2755,115 @@ def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 	finally:
 		PROGRESS.finish()
 
+def process_reposts_for_dump(conn, dump_path: str, pacer, safety_config: dict, config: dict, notifier=None):
+	"""
+	Process reposts found inside a profile export dump.
+	Downloads into downloads/reposts/ with full priority/refile logic.
+	"""
+	from db import record_failure
+
+	reposts_json = os.path.join(dump_path, REPOSTS_PATH)
+	if not file_exists_nonempty(reposts_json):
+		print("No reposts.json found in this dump.")
+		return True
+
+	posts = parse_reposts_json(reposts_json)
+	if not posts:
+		print("No reposts to process.")
+		return True
+
+	download_base_dir = config.get('DOWNLOAD_DIRECTORY', os.path.join(os.path.dirname(__file__), 'downloads'))
+	target_dir = ensure_thread_dir(download_base_dir, "reposts")
+
+	seen: set[str] = set()
+	filtered = [p for p in posts if p.get('shortcode') and p['shortcode'] not in seen and not seen.add(p['shortcode'])]
+
+	print(f"Found {len(filtered)} repost(s). Starting downloads...")
+	PROGRESS.start(len(filtered))
+	try:
+		for post in filtered:
+			if SHUTDOWN.is_set():
+				print("Shutdown requested. Exiting reposts loop.")
+				return False
+
+			shortcode = post['shortcode']
+			existing = get_existing_downloads(conn, shortcode)
+			if existing:
+				best_ep = min(_source_priority(r['source'], r.get('collection')) for r in existing)
+				current_ep = _source_priority('reposts', None)
+				if current_ep > best_ep:
+					SESSION_TRACKER.record_download_skip()
+					PROGRESS.on_skip()
+					log_line(f"[SKIP] {shortcode} already filed under higher-priority source", snapshot=True)
+					continue
+				elif current_ep < best_ep:
+					log_line(f"[REFILE] {shortcode} moving to reposts folder", snapshot=True)
+					refile_post(conn, post, existing)
+
+			retry_count = 0
+			while True:
+				try:
+					ok = download_post(conn, post, target_dir, pacer, config)
+					if ok and pacer:
+						pacer.after_success()
+					break
+				except RateLimitError:
+					SESSION_TRACKER.record_rate_limit()
+					base_delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE) - 1)]
+					delay = get_jittered_delay(base_delay)
+					print(f"[BLOCK] Rate limited. Retrying in {delay}s.")
+					if wait_with_progress("Rate limit", delay):
+						return False
+					retry_count += 1
+				except CheckpointError:
+					print("[BLOCK] Checkpoint/challenge. Use manual login then retry.")
+					if notifier is not None:
+						notifier("Instagram Export – Attention Required",
+							f"Manual decision required (checkpoint) for {shortcode}.")
+					resp = input("[Enter]=retry  |  M=manual login  |  S=skip  |  Q=quit > ").strip().lower()
+					log_user_input("CHECKPOINT_MENU", resp)
+					if resp == "q": return False
+					if resp == "s":
+						record_failure(conn, post, "Skipped during checkpoint")
+						break
+					if resp == "m":
+						config = read_config()
+						profile_dir, cookie_file = resolve_profile_and_cookie(config)
+						manual_login_and_export_cookies(profile_dir, cookie_file)
+				except LoginRequiredError:
+					print("[BLOCK] Login required. Revalidate cookies.")
+					resp = input("[M]=manual login  |  R=retry  |  S=skip  |  Q=quit > ").strip().lower()
+					log_user_input("LOGIN_REQUIRED_MENU", resp)
+					if resp == "q": return False
+					if resp == "s":
+						record_failure(conn, post, "Skipped after login-required")
+						break
+					if resp == "m":
+						config = read_config()
+						profile_dir, cookie_file = resolve_profile_and_cookie(config)
+						manual_login_and_export_cookies(profile_dir, cookie_file)
+				except NotFoundError:
+					record_failure(conn, post, "Deleted/private/unavailable")
+					SESSION_TRACKER.record_download_skip()
+					PROGRESS.on_skip()
+					log_line(f"[SKIP] Unavailable/deleted/private: {shortcode}", snapshot=True)
+					break
+
+		print("Reposts processing complete.")
+		if notifier is not None:
+			summary = (
+				f"Reposts run complete. "
+				f"Attempted: {SESSION_TRACKER.downloads_attempted}, "
+				f"OK: {SESSION_TRACKER.downloads_successful}, "
+				f"Failed: {SESSION_TRACKER.downloads_failed}, "
+				f"Skipped: {SESSION_TRACKER.downloads_skipped}"
+			)
+			notifier("Instagram Export – Reposts", summary)
+		return True
+	finally:
+		PROGRESS.finish()
+
+
 def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, config: dict, notifier=None):
 	"""
 	Process Saved posts found inside a profile export dump.
@@ -2669,6 +2878,23 @@ def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 
 	unsorted_posts = parse_saved_posts_json(saved_posts_json)
 	collected_posts = parse_saved_collections_json(saved_cols_json)
+
+	# JansonReposts cross-ref: for jansonhortuy dumps, posts in JansonReposts that also
+	# exist in reposts.json are dropped (reposts source handles them at higher priority);
+	# posts only in JansonReposts get moved to JansonRepostsDefunct.
+	if _dump_username(dump_path) == JANSONHORTUY_USERNAME:
+		reposts_json = os.path.join(dump_path, REPOSTS_PATH)
+		reposts_shortcodes: set[str] = {
+			p['shortcode'] for p in parse_reposts_json(reposts_json)
+		}
+		filtered_collected = []
+		for p in collected_posts:
+			if p.get('_collection') == JANSON_REPOSTS_COLLECTION:
+				if p['shortcode'] in reposts_shortcodes:
+					continue  # reposts.json has priority, skip entirely
+				p = dict(p, _collection=JANSON_REPOSTS_DEFUNCT)
+			filtered_collected.append(p)
+		collected_posts = filtered_collected
 
 	# Collections first so named collections win in-memory dedup over unsorted
 	all_posts = []
@@ -2837,10 +3063,10 @@ def print_page(dumps, dump_availability, page):
     end = start + PAGE_SIZE
     page_items = dumps[start:end]
     print("Select which profile dump to download from ({} available):".format(len(dumps)))
-    print("Legend: [p] Profile Posts | [l] Liked | [s] Saved | [d] DMs\n")
+    print("Legend: [p] Profile Posts | [l] Liked | [r] Reposts | [s] Saved | [d] DMs\n")
     for idx, (name, _) in enumerate(page_items, start + 1):
-        avail = dump_availability.get(name, {'p': False, 'l': False, 's': False, 'd': False})
-        flags = ''.join([c if avail[c] else ' ' for c in 'plsd'])
+        avail = dump_availability.get(name, {'p': False, 'l': False, 'r': False, 's': False, 'd': False})
+        flags = ''.join([c if avail.get(c) else ' ' for c in 'plrsd'])
         print(f"{idx:2d}. {name:<35} [{flags}]")
     if len(dumps) > PAGE_SIZE:
         if end < len(dumps):
@@ -2856,6 +3082,8 @@ def print_options_menu(avail):
         options.append("Profile Posts Download")
     if avail['l']:
         options.append("Liked Posts Download")
+    if avail.get('r'):
+        options.append("Reposts Download")
     if avail['s']:
         options.append("Saved Posts Download")
     if avail['d']:
@@ -3137,6 +3365,23 @@ def main():
                                     user_resp = input("Press Enter to return to main menu...")
                                     log_user_input("PRESS_ENTER_RETURN_MENU", user_resp)
                                     break
+                                elif "Reposts Download" in selected_option:
+                                    result = process_reposts_for_dump(conn, selected_path, pacer, safety_config, config, notifier)
+                                    if result is True:
+                                        print("\nDownload Statistics:")
+                                        stats = get_download_stats(conn)
+                                        for key, value in stats.items():
+                                            print(f"  {key}: {value}")
+                                        user_resp = input("Press Enter to return to main menu...")
+                                        log_user_input("PRESS_ENTER_RETURN_MENU", user_resp)
+                                        break
+                                    elif result is False:
+                                        return
+                                    else:
+                                        print("No reposts to process.")
+                                        user_resp = input("Press Enter to return to main menu...")
+                                        log_user_input("PRESS_ENTER_RETURN_MENU", user_resp)
+                                        break
                                 elif "Liked Posts Download" in selected_option:
                                     result = process_liked_for_dump(conn, selected_path, pacer, safety_config, config, notifier)
                                     if result is True:

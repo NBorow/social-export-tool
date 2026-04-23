@@ -70,6 +70,24 @@ def init_db(db_path: str) -> sqlite3.Connection:
     except sqlite3.OperationalError:
         pass  # column already exists
 
+    # Backfill collection from local_path for old saved records.
+    # Path structure: .../saved/<CollectionName>/<filename>
+    # so os.path.basename(os.path.dirname(local_path)) gives the collection name.
+    try:
+        cursor = conn.execute(
+            "SELECT id, local_path FROM posts WHERE source='saved' AND collection IS NULL AND local_path IS NOT NULL"
+        )
+        updates = []
+        for row_id, local_path in cursor.fetchall():
+            collection = os.path.basename(os.path.dirname(local_path))
+            if collection and collection != 'saved':
+                updates.append((collection, row_id))
+        if updates:
+            conn.executemany("UPDATE posts SET collection=? WHERE id=?", updates)
+            conn.commit()
+    except Exception:
+        pass
+
     return conn
 
 
