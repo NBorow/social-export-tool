@@ -32,7 +32,7 @@ except ImportError:
 	Pushbullet = None  # type: ignore
 
 # Import database functions
-from db import init_db, is_downloaded, get_post, record_download, record_failure, get_download_stats, close_db, get_recent_download_timestamps
+from db import init_db, is_downloaded, get_post, get_existing_downloads, record_download, record_failure, get_download_stats, close_db, get_recent_download_timestamps
 
 # --- Shutdown + cancelable sleep helpers ---
 SHUTDOWN = threading.Event()
@@ -382,6 +382,18 @@ DM_INBOX_PATH = os.path.join('your_instagram_activity', 'messages', 'inbox')
 # Target base subfolder for saved downloads
 SAVED_BASE_SUBDIR = "saved"
 UNSORTED_COLLECTION_DIRNAME = "_unsorted"
+
+# Priority: lower number = wins. Named collections beat unsorted saved, which beats DMs, which beat liked.
+_SOURCE_EFFECTIVE_PRIORITY: dict[tuple[str, bool], int] = {
+    ("saved", False): 0,  # saved + named collection
+    ("saved", True):  1,  # saved + _unsorted
+    ("dm",    False): 2,
+    ("liked", False): 3,
+}
+
+def _source_priority(source: str, collection: str | None) -> int:
+    is_unsorted = source == "saved" and (not collection or collection == UNSORTED_COLLECTION_DIRNAME)
+    return _SOURCE_EFFECTIVE_PRIORITY.get((source, is_unsorted), 99)
 
 # --- Safety Settings ---
 SAFETY_KEYS = [
@@ -1290,7 +1302,8 @@ def parse_saved_collections_json(saved_collections_json_path: str) -> list[dict]
 			data = json.load(f) or {}
 		items = data.get("saved_saved_collections") or []
 		current_collection = None
-		seen = set()
+		# shortcode -> post dict; replaced when a more-recently-added entry is found
+		best: dict[str, dict] = {}
 
 		for it in items:
 			title = it.get("title")
@@ -1310,23 +1323,29 @@ def parse_saved_collections_json(saved_collections_json_path: str) -> list[dict]
 			if not href:
 				continue
 			ts = (smd.get("Added Time") or {}).get("timestamp") or 0
+			ts_ms = int(ts) * 1000 if ts else 0
 
 			shortcode = extract_shortcode_from_url(href)
-			if not shortcode or shortcode in seen:
+			if not shortcode:
 				continue
-			seen.add(shortcode)
 
-			posts.append({
+			candidate = {
 				"shortcode": shortcode,
 				"url": href,
 				"original_owner": None,
-				"username": name_map.get("value"),  # often the IG handle shown next to href
+				"username": name_map.get("value"),
 				"description": "",
-				"timestamp_ms": int(ts) * 1000 if ts else 0,
+				"timestamp_ms": ts_ms,
 				"source": "saved",
 				"dm_thread": None,
-				"_collection": current_collection,  # may be None if header missing
-			})
+				"_collection": current_collection,
+			}
+
+			existing = best.get(shortcode)
+			if existing is None or ts_ms > existing["timestamp_ms"]:
+				best[shortcode] = candidate
+
+		posts = list(best.values())
 	except Exception as e:
 		print(f"[WARN] Failed to parse saved_collections.json: {e}")
 	return posts
@@ -1489,6 +1508,24 @@ def extract_dm_posts_and_profiles(dm_json_path, thread_name=None):
         print(f"Error parsing DM JSON {dm_json_path}: {e}")
     
     return posts, profiles, send_text_hits
+
+def refile_post(conn, post: dict, existing_records: list[dict]) -> None:
+	"""
+	Delete old file(s) and all DB records for a shortcode so the caller's
+	retry loop can re-download it to the correct higher-priority location.
+	"""
+	shortcode = post.get('shortcode', '?')
+	for rec in existing_records:
+		old_path = rec.get('local_path')
+		if old_path and os.path.exists(old_path):
+			try:
+				os.remove(old_path)
+				log_line(f"[REFILE] Removed old file: {old_path}", snapshot=False)
+			except OSError as e:
+				log_line(f"[REFILE] Could not remove {old_path}: {e}", snapshot=False)
+	conn.execute('DELETE FROM posts WHERE shortcode = ?', (shortcode,))
+	conn.commit()
+
 
 def download_post(conn, post_data, download_dir, pacer=None, config=None):
 	"""
@@ -2341,6 +2378,24 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
                 # Add send message flag to post data
                 post['append_send_for_this_run'] = append_send_for_this_run
 
+                # Priority check: if already filed under a higher-priority source, skip or refile
+                shortcode = post.get('shortcode')
+                if shortcode:
+                    existing = get_existing_downloads(conn, shortcode)
+                    if existing:
+                        best_ep = min(_source_priority(r['source'], r.get('collection')) for r in existing)
+                        current_ep = _source_priority(post.get('source', 'dm'), post.get('_collection'))
+                        if current_ep > best_ep:
+                            SESSION_TRACKER.record_download_skip()
+                            PROGRESS.on_skip()
+                            log_line(f"[SKIP] {shortcode} already filed under higher-priority source", snapshot=True)
+                            continue
+                        elif current_ep < best_ep:
+                            log_line(f"[REFILE] {shortcode} moving to higher-priority location: {thread_dir}", snapshot=True)
+                            refile_post(conn, post, existing)
+                            # fall through — retry loop re-downloads to thread_dir, handles rate limits
+                        # same priority — fall through to download_post which handles via inner check
+
                 # Use our existing download method with exception handling
                 retry_count = 0
                 while True:
@@ -2508,12 +2563,19 @@ def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 			if not shortcode:
 				continue
 
-			# If any source already downloaded this shortcode, skip silently (no DB write).
-			if is_downloaded(conn, shortcode):
-				SESSION_TRACKER.record_download_skip()
-				PROGRESS.on_skip()  # Update progress BEFORE taking snapshot
-				log_line(f"[SKIP] {shortcode} already downloaded", snapshot=True)
-				continue
+			existing = get_existing_downloads(conn, shortcode)
+			if existing:
+				best_ep = min(_source_priority(r['source'], r.get('collection')) for r in existing)
+				current_ep = _source_priority(post.get('source', 'liked'), post.get('_collection'))
+				if current_ep >= best_ep:
+					SESSION_TRACKER.record_download_skip()
+					PROGRESS.on_skip()
+					log_line(f"[SKIP] {shortcode} already downloaded under equal or higher-priority source", snapshot=True)
+					continue
+				# liked is higher priority than existing — unlikely given the ordering but handle it
+				log_line(f"[REFILE] {shortcode} moving to higher-priority location", snapshot=True)
+				refile_post(conn, post, existing)
+				# fall through — retry loop re-downloads to target_dir, handles rate limits
 
 			retry_count = 0
 			while True:
@@ -2608,9 +2670,10 @@ def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 	unsorted_posts = parse_saved_posts_json(saved_posts_json)
 	collected_posts = parse_saved_collections_json(saved_cols_json)
 
+	# Collections first so named collections win in-memory dedup over unsorted
 	all_posts = []
 	seen = set()
-	for p in (unsorted_posts + collected_posts):
+	for p in (collected_posts + unsorted_posts):
 		sc = p.get("shortcode")
 		if sc and sc not in seen:
 			seen.add(sc)
@@ -2630,16 +2693,24 @@ def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 				return False
 
 			shortcode = post["shortcode"]
-			# Skip re-downloads if any source already succeeded for this shortcode
-			if is_downloaded(conn, shortcode):
-				SESSION_TRACKER.record_download_skip()
-				PROGRESS.on_skip()  # Update progress BEFORE taking snapshot
-				log_line(f"[SKIP] Already downloaded {shortcode}", snapshot=True)
-				continue
-
 			# Resolve target dir per collection
 			collection_name = post.get("_collection") or UNSORTED_COLLECTION_DIRNAME
 			target_dir = ensure_collection_dir(download_base_dir, collection_name)
+
+			existing = get_existing_downloads(conn, shortcode)
+			if existing:
+				best_ep = min(_source_priority(r['source'], r.get('collection')) for r in existing)
+				current_ep = _source_priority(post.get('source', 'saved'), post.get('_collection'))
+				if current_ep > best_ep:
+					SESSION_TRACKER.record_download_skip()
+					PROGRESS.on_skip()
+					log_line(f"[SKIP] {shortcode} already filed under higher-priority source", snapshot=True)
+					continue
+				elif current_ep < best_ep:
+					log_line(f"[REFILE] {shortcode} moving to higher-priority location: {collection_name}", snapshot=True)
+					refile_post(conn, post, existing)
+					# fall through — retry loop re-downloads to target_dir, handles rate limits
+				# same priority — fall through, download_post inner check will skip
 
 			retry_count = 0
 			while True:

@@ -62,6 +62,14 @@ def init_db(db_path: str) -> sqlite3.Connection:
     ''')
     
     conn.commit()
+
+    # Migrate: add collection column if this is an older DB
+    try:
+        conn.execute('ALTER TABLE posts ADD COLUMN collection TEXT')
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
     return conn
 
 
@@ -81,6 +89,15 @@ def is_downloaded(conn: sqlite3.Connection, shortcode: str) -> bool:
         (shortcode,)
     )
     return cursor.fetchone() is not None
+
+
+def get_existing_downloads(conn: sqlite3.Connection, shortcode: str) -> list:
+    """Return all successful download records for a shortcode (source, collection, local_path)."""
+    cursor = conn.execute(
+        'SELECT source, collection, local_path FROM posts WHERE shortcode = ? AND status = "success"',
+        (shortcode,)
+    )
+    return [{'source': r[0], 'collection': r[1], 'local_path': r[2]} for r in cursor.fetchall()]
 
 
 def get_post(conn: sqlite3.Connection, shortcode: str) -> Optional[Dict]:
@@ -120,10 +137,10 @@ def record_download(conn: sqlite3.Connection, post: Dict, local_path: Optional[s
         conn.execute('''
             INSERT INTO posts (
                 shortcode, url, description, original_owner, caption,
-                source, username, timestamp_ms, status, downloaded_at,
+                source, collection, username, timestamp_ms, status, downloaded_at,
                 error_message, dm_thread, local_path
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'success', CURRENT_TIMESTAMP, NULL, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', CURRENT_TIMESTAMP, NULL, ?, ?)
             ON CONFLICT(shortcode, source) DO UPDATE SET
                 status='success',
                 error_message=NULL,
@@ -132,6 +149,7 @@ def record_download(conn: sqlite3.Connection, post: Dict, local_path: Optional[s
                 description=excluded.description,
                 original_owner=excluded.original_owner,
                 caption=excluded.caption,
+                collection=excluded.collection,
                 username=excluded.username,
                 timestamp_ms=excluded.timestamp_ms,
                 dm_thread=excluded.dm_thread,
@@ -143,6 +161,7 @@ def record_download(conn: sqlite3.Connection, post: Dict, local_path: Optional[s
             post.get('original_owner'),
             post.get('caption'),
             post.get('source'),
+            post.get('_collection'),
             post.get('username'),
             post.get('timestamp_ms'),
             post.get('dm_thread'),
