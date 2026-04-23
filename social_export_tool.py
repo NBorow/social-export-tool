@@ -656,7 +656,8 @@ def manual_login_and_export_cookies(profile_dir: str, cookie_file: str) -> bool:
 		print("[Manual Login] Chrome opened with profile:", profile_dir)
 		print("[Manual Login] Log in manually. Complete any 2FA/checkpoints.")
 		print("="*60)
-		input("\n[Manual Login] ⚠️  When your feed/profile is visible, press ENTER here... ")
+		user_resp = input("\n[Manual Login] ⚠️  When your feed/profile is visible, press ENTER here... ")
+		log_user_input("MANUAL_LOGIN_WAIT", user_resp)
 
 		driver.get("https://www.instagram.com/")
 		if wait_with_progress("Login pause", 2):
@@ -854,6 +855,7 @@ def save_config(new_values):
 def _prompt_int(prompt_text, default=None, allow_blank=True, allow_minus1=False):
 	while True:
 		s = input(prompt_text).strip()
+		log_user_input("CONFIG_EDIT_INT", s)
 		if s.lower() == 'b':
 			return 'BACK'
 		if s == '' and allow_blank:
@@ -881,6 +883,7 @@ def edit_delay_pair(cfg):
 		return edit_delay_pair(cfg)
 	if min_new > max_new:
 		resp = input(f"  Min {min_new} > Max {max_new}. Set Max to {min_new}? (y/N): ").strip().lower()
+		log_user_input("CONFIG_EDIT_DELAY_FIX", resp)
 		if resp == 'y':
 			max_new = min_new
 		else:
@@ -915,6 +918,7 @@ def edit_long_break_pair(cfg):
 		return edit_long_break_pair(cfg)
 	if min_new > max_new:
 		resp = input(f"  Break min {min_new} > max {max_new}. Set max to {min_new}? (y/N): ").strip().lower()
+		log_user_input("CONFIG_EDIT_LONG_BREAK_FIX", resp)
 		if resp == 'y':
 			max_new = min_new
 		else:
@@ -956,6 +960,7 @@ def edit_safer_manual_login(cfg):
 	
 	while True:
 		choice = input("  New value (true/false): ").strip().lower()
+		log_user_input("CONFIG_EDIT_SAFER_MANUAL_LOGIN", choice)
 		if choice == 'b':
 			return False
 		if choice == '':
@@ -978,6 +983,7 @@ def edit_auto_retry_on_rate_limit(cfg):
 	
 	while True:
 		choice = input("  New value (true/false): ").strip().lower()
+		log_user_input("CONFIG_EDIT_AUTO_RETRY", choice)
 		if choice == 'b':
 			return False
 		if choice == '':
@@ -998,6 +1004,7 @@ def edit_profile_dir(cfg):
 	print("  Enter full path (e.g., C:\\Users\\you\\ig_profile) or leave blank for default")
 	
 	choice = input("  New value: ").strip()
+	log_user_input("CONFIG_EDIT_PROFILE_DIR", choice)
 	if choice == 'b':
 		return False
 	
@@ -1295,10 +1302,12 @@ def parse_saved_collections_json(saved_collections_json_path: str) -> list[dict]
 				continue
 
 			# Item row: belongs to current_collection
+			if current_collection is None:
+				log_line(f"[WARN] Saved collections: post row found before any collection header, skipping", snapshot=False)
+				continue
 			name_map = smd.get("Name") or {}
 			href = (name_map.get("href") or "").strip()
 			if not href:
-				# Some exports might not set href on header rows or malformed rows
 				continue
 			ts = (smd.get("Added Time") or {}).get("timestamp") or 0
 
@@ -1631,6 +1640,8 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 				log_line(f"[DUPLICATE] {shortcode} already in database", snapshot=True)
 				SESSION_TRACKER.record_download_skip()
 				PROGRESS.on_skip()
+				if pacer:
+					pacer.after_success()
 			else:
 				log_line(f"[ERROR] {shortcode} → database error", snapshot=True)
 				SESSION_TRACKER.record_error(f"Database error for {shortcode}")
@@ -2065,6 +2076,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                         retry_count += 1
                         continue
                     resp = input("[Enter]=retry now  |  D=delayed exponential retry  |  S=skip this item  |  Q=quit run > ").strip().lower()
+                    log_user_input("RATE_LIMIT_MENU", resp)
                     if resp == "q":
                         return False
                     if resp == "s":
@@ -2081,6 +2093,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                     print("[Advice] Complete MANUAL LOGIN with the same persistent profile (or wait/switch), then retry.")
                     print("[Advice] After clearing the challenge, waiting ~30–60 minutes before resuming is safest.")
                     resp = input("[Enter]=retry  |  M=manual login now  |  S=skip  |  Q=quit > ").strip().lower()
+                    log_user_input("CHECKPOINT_MENU", resp)
                     if resp == "q":
                         return False
                     if resp == "s":
@@ -2099,6 +2112,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                     print(f"\n[BLOCK] Login required (cookies/session invalid).")
                     print("[Advice] Revalidate cookies via MANUAL LOGIN, then retry.")
                     resp = input("[M]=manual login now  |  R=retry with current cookies  |  S=skip  |  Q=quit > ").strip().lower()
+                    log_user_input("LOGIN_REQUIRED_MENU", resp)
                     if resp == "q":
                         return False
                     if resp == "s":
@@ -2159,22 +2173,35 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
 
         if not message_files:
             print("No message files found in DM inbox")
-            return False
+            return None  # Return to previous menu
 
         log_line(f"Found {len(message_files)} DM conversations", snapshot=False)
 
-        # Display available DM conversations
-        print("\nAvailable DM conversations:")
-        for i, msg_file in enumerate(message_files, 1):
-            thread_name = os.path.basename(os.path.dirname(msg_file))
-            print(f"{i}. {thread_name}")
-        print("a) Download all conversations")
-        print("b) Back to options menu")
-        print("q) Quit")
+        # Helper function to print a page of DM conversations
+        def print_dm_page(message_files, page):
+            start = page * PAGE_SIZE
+            end = start + PAGE_SIZE
+            page_items = message_files[start:end]
+            print("\nAvailable DM conversations ({} available):".format(len(message_files)))
+            for idx, msg_file in enumerate(page_items, start + 1):
+                thread_name = os.path.basename(os.path.dirname(msg_file))
+                print(f"{idx}. {thread_name}")
+            if len(message_files) > PAGE_SIZE:
+                if end < len(message_files):
+                    print("n) Next page")
+                if page > 0:
+                    print("p) Previous page")
+            print("a) Download all conversations")
+            print("b) Back to options menu")
+            print("q) Quit")
 
-        # Get user selection
-        while True:
-            choice = input("\nSelect which conversation(s) to download (number, 'a' for all, 'b' for back, or 'q' to quit): ").strip().lower()
+        # Get user selection with pagination
+        page = 0
+        selected_files = None
+        while selected_files is None:
+            print_dm_page(message_files, page)
+            choice = input("\nSelect which conversation(s) to download (number, 'a' for all, 'b' for back, 'n'/'p' for pages, or 'q' to quit): ").strip().lower()
+            log_user_input("DM_CONVERSATION_SELECT", choice)
 
             if choice == 'q':
                 print("Quitting.")
@@ -2185,15 +2212,19 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
             elif choice == 'a':
                 selected_files = message_files
                 break
+            elif len(message_files) > PAGE_SIZE and choice == 'n' and (page + 1) * PAGE_SIZE < len(message_files):
+                page += 1
+            elif len(message_files) > PAGE_SIZE and choice == 'p' and page > 0:
+                page -= 1
             elif choice.isdigit():
                 num = int(choice)
                 if 1 <= num <= len(message_files):
                     selected_files = [message_files[num - 1]]
                     break
                 else:
-                    print(f"Invalid choice. Please enter a number between 1 and {len(message_files)}, 'a', 'b', or 'q'.")
+                    print(f"Invalid choice. Please enter a number between 1 and {len(message_files)}, 'a', 'b', 'n', 'p', or 'q'.")
             else:
-                print(f"Invalid choice. Please enter a number between 1 and {len(message_files)}, 'a', 'b', or 'q'.")
+                print(f"Invalid choice. Please enter a number between 1 and {len(message_files)}, 'a', 'b', 'n', 'p', or 'q'.")
 
         # Get download directory from config
         config = read_config()
@@ -2299,6 +2330,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
             if ASK_FOR_SEND_MESSAGE_APPEND and send_text_hits > 0:
                 print(f"Detected {send_text_hits} send messages (<1s after shares) in this conversation.")
                 choice = input("Append them to filenames for this run? [y/N]: ").strip().lower()
+                log_user_input("APPEND_SEND_MESSAGE", choice)
                 append_send_for_this_run = (choice == 'y')
 
             # Download the collected posts for this thread into the per-thread folder
@@ -2344,6 +2376,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
                                 f"Manual decision required (rate_limit) for {short}. Attach to tmux and respond."
                             )
                         resp = input("[Enter]=retry now  |  D=delayed exponential retry  |  S=skip this item  |  Q=quit run > ").strip().lower()
+                        log_user_input("RATE_LIMIT_MENU", resp)
                         if resp == "q":
                             return False
                         if resp == "s":
@@ -2365,6 +2398,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
                                 f"Manual decision required (checkpoint) for {short}. Attach to tmux and respond."
                             )
                         resp = input("[Enter]=retry  |  M=manual login now  |  S=skip  |  Q=quit > ").strip().lower()
+                        log_user_input("CHECKPOINT_MENU", resp)
                         if resp == "q":
                             return False
                         if resp == "s":
@@ -2389,6 +2423,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
                                 f"Manual decision required (login_required) for {short}. Attach to tmux and respond."
                             )
                         resp = input("[M]=manual login now  |  R=retry with current cookies  |  S=skip  |  Q=quit > ").strip().lower()
+                        log_user_input("LOGIN_REQUIRED_MENU", resp)
                         if resp == "q":
                             return False
                         if resp == "s":
@@ -2506,6 +2541,7 @@ def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 							f"Manual decision required (checkpoint) for {short}. Attach to tmux and respond."
 						)
 					resp = input("[Enter]=retry  |  M=manual login  |  S=skip  |  Q=quit > ").strip().lower()
+					log_user_input("CHECKPOINT_MENU", resp)
 					if resp == "q": return False
 					if resp == "s":
 						record_failure(conn, post, "Skipped during checkpoint")
@@ -2526,6 +2562,7 @@ def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 							f"Manual decision required (login_required) for {short}. Attach to tmux and respond."
 						)
 					resp = input("[M]=manual login  |  R=retry  |  S=skip  |  Q=quit > ").strip().lower()
+					log_user_input("LOGIN_REQUIRED_MENU", resp)
 					if resp == "q": return False
 					if resp == "s":
 						record_failure(conn, post, "Skipped after login-required")
@@ -2630,6 +2667,7 @@ def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 							f"Manual decision required (checkpoint) for {short}. Attach to tmux and respond."
 						)
 					resp = input("[Enter]=retry  |  M=manual login  |  S=skip  |  Q=quit > ").strip().lower()
+					log_user_input("CHECKPOINT_MENU", resp)
 					if resp == "q": return False
 					if resp == "s":
 						record_failure(conn, post, "Skipped during checkpoint")
@@ -2650,6 +2688,7 @@ def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 							f"Manual decision required (login_required) for {short}. Attach to tmux and respond."
 						)
 					resp = input("[M]=manual login  |  R=retry  |  S=skip  |  Q=quit > ").strip().lower()
+					log_user_input("LOGIN_REQUIRED_MENU", resp)
 					if resp == "q": return False
 					if resp == "s":
 						record_failure(conn, post, "Skipped after login-required")
@@ -2790,6 +2829,7 @@ def apply_safety_preset():
     
     while True:
         choice = input("\nSelect preset (1-5) or b to back: ").strip().lower()
+        log_user_input("SAFETY_PRESET_SELECT", choice)
         if choice == 'b':
             return
         
@@ -2856,6 +2896,7 @@ def edit_safety_values():
             print(f"{key}: {old_val} → {new_val}")
         
         save_choice = input("\nSave changes? (y/n): ").strip().lower()
+        log_user_input("CONFIG_SAVE_CHANGES", save_choice)
         if save_choice == 'y':
             try:
                 # Add custom preset comment
@@ -2880,6 +2921,7 @@ def settings_menu():
         print("q) Quit")
         
         choice = input("\nEnter your choice: ").strip().lower()
+        log_user_input("SETTINGS_MENU", choice)
         
         if choice == '1':
             view_safety_settings()
@@ -2905,10 +2947,21 @@ def main():
     install_signal_handlers()
     
     # Resolve log directory, install run logger
-    global RUN_LOG_DIR, RUN_LOG_PATH, FAIL_LOG_PATH
+    global RUN_LOG_DIR, RUN_LOG_PATH, FAIL_LOG_PATH, RUN_ID, _RUN_END_WRITTEN
     RUN_LOG_DIR = resolve_log_dir(config)
     RUN_LOG_PATH = _install_run_logger(RUN_LOG_DIR)
     FAIL_LOG_PATH = os.path.join(RUN_LOG_DIR, "total_failures.log")
+    
+    # Generate run ID and write run start marker to total_failures.log
+    # This must happen before any log_total_failure() calls
+    RUN_ID = datetime.now().strftime("%Y%m%d-%H%M%S")
+    _RUN_END_WRITTEN = False  # Reset flag for this run
+    iso_timestamp = datetime.now().isoformat()
+    with open(FAIL_LOG_PATH, "a", encoding="utf-8") as fh:
+        fh.write(f"===== RUN START | {iso_timestamp} | run_id={RUN_ID} =====\n")
+    
+    # Register run end marker to be written on exit (idempotent)
+    atexit.register(_write_run_end_marker)
     
     # (optional) echo where failures will be recorded
     print(f"[LOG] Failures will append to: {FAIL_LOG_PATH}")
@@ -2960,6 +3013,7 @@ def main():
                 invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, 'c', or 'q'."
             
             choice = input(prompt_msg).strip().lower()
+            log_user_input("MAIN_MENU_DUMP_SELECT", choice)
             if choice.isdigit():
                 num = int(choice)
                 if 1 <= num <= len(dumps):
@@ -2970,11 +3024,13 @@ def main():
                     
                     if not options:
                         print("No download options available for this profile dump.")
-                        input("Press Enter to return to main menu...")
+                        user_resp = input("Press Enter to return to main menu...")
+                        log_user_input("PRESS_ENTER_RETURN_MENU", user_resp)
                         continue
                     
                     while True:
                         opt_choice = input("Enter your choice (number, b, or q): ").strip().lower()
+                        log_user_input("OPTIONS_MENU", opt_choice)
                         if opt_choice == 'q':
                             print("Quitting.")
                             return
@@ -2995,7 +3051,8 @@ def main():
                                         stats = get_download_stats(conn)
                                         for key, value in stats.items():
                                             print(f"  {key}: {value}")
-                                        input("Press Enter to return to main menu...")
+                                        user_resp = input("Press Enter to return to main menu...")
+                                        log_user_input("PRESS_ENTER_RETURN_MENU", user_resp)
                                         break
                                     elif result is False:
                                         # User quit the program
@@ -3006,7 +3063,8 @@ def main():
                                         continue
                                 elif "Profile Posts Download" in selected_option:
                                     print("Profile posts download not yet implemented")
-                                    input("Press Enter to return to main menu...")
+                                    user_resp = input("Press Enter to return to main menu...")
+                                    log_user_input("PRESS_ENTER_RETURN_MENU", user_resp)
                                     break
                                 elif "Liked Posts Download" in selected_option:
                                     result = process_liked_for_dump(conn, selected_path, pacer, safety_config, config, notifier)
@@ -3015,13 +3073,15 @@ def main():
                                         stats = get_download_stats(conn)
                                         for key, value in stats.items():
                                             print(f"  {key}: {value}")
-                                        input("Press Enter to return to main menu...")
+                                        user_resp = input("Press Enter to return to main menu...")
+                                        log_user_input("PRESS_ENTER_RETURN_MENU", user_resp)
                                         break
                                     elif result is False:
                                         return
                                     else:
                                         print("No liked posts to process.")
-                                        input("Press Enter to return to main menu...")
+                                        user_resp = input("Press Enter to return to main menu...")
+                                        log_user_input("PRESS_ENTER_RETURN_MENU", user_resp)
                                         break
                                 elif "Saved Posts Download" in selected_option:
                                     result = process_saved_for_dump(conn, selected_path, pacer, safety_config, config, notifier)
@@ -3030,13 +3090,15 @@ def main():
                                         stats = get_download_stats(conn)
                                         for key, value in stats.items():
                                             print(f"  {key}: {value}")
-                                        input("Press Enter to return to main menu...")
+                                        user_resp = input("Press Enter to return to main menu...")
+                                        log_user_input("PRESS_ENTER_RETURN_MENU", user_resp)
                                         break
                                     elif result is False:
                                         return
                                     else:
                                         print("No saved posts to process.")
-                                        input("Press Enter to return to main menu...")
+                                        user_resp = input("Press Enter to return to main menu...")
+                                        log_user_input("PRESS_ENTER_RETURN_MENU", user_resp)
                                         break
                             else:
                                 print(f"Invalid option. Please enter a number between 1 and {len(options)}, 'b', or 'q'.")
@@ -3046,7 +3108,8 @@ def main():
                     continue
                 else:
                     print(invalid_msg)
-                    input("Press Enter to continue...")
+                    user_resp = input("Press Enter to continue...")
+                    log_user_input("PRESS_ENTER_CONTINUE", user_resp)
             elif len(dumps) > PAGE_SIZE and choice == 'n' and (page + 1) * PAGE_SIZE < len(dumps):
                 page += 1
             elif len(dumps) > PAGE_SIZE and choice == 'p' and page > 0:
@@ -3062,7 +3125,8 @@ def main():
                 break
             else:
                 print(invalid_msg)
-                input("Press Enter to continue...")
+                user_resp = input("Press Enter to continue...")
+                log_user_input("PRESS_ENTER_CONTINUE", user_resp)
     
     finally:
         # Print session summary on exit
@@ -3074,6 +3138,9 @@ def main():
         if FAIL_LOG_PATH and os.path.exists(FAIL_LOG_PATH):
             print(f"[LOG] Failures file: {FAIL_LOG_PATH}")
         
+        # Write run end marker to total_failures.log
+        _write_run_end_marker()
+        
         # Clean exit - close database connection
         close_db(conn)
 
@@ -3081,6 +3148,8 @@ def main():
 RUN_LOG_DIR = None
 RUN_LOG_PATH = None
 FAIL_LOG_PATH = None
+RUN_ID = None
+_RUN_END_WRITTEN = False
 
 # --- Pre-flight checks ---
 def check_ffmpeg_availability():
@@ -3435,6 +3504,32 @@ def _install_run_logger(log_dir: str) -> str:
     atexit.register(lambda: (f.flush(), f.close()))
     print(f"[LOG] Writing this run to: {path}")
     return path
+
+def log_user_input(context_label: str, raw_input: str):
+    """
+    Log user input to the run log file only (not to terminal).
+    This is a logging-only instrumentation that writes directly to the run log.
+    """
+    global RUN_LOG_PATH
+    if RUN_LOG_PATH:
+        try:
+            with open(RUN_LOG_PATH, "a", encoding="utf-8") as fh:
+                fh.write(f"[USER_INPUT] {context_label} => \"{raw_input}\"\n")
+        except Exception:
+            # Silently fail - don't interrupt user flow
+            pass
+
+def _write_run_end_marker():
+    """Write run end marker to total_failures.log (idempotent)"""
+    global FAIL_LOG_PATH, RUN_ID, _RUN_END_WRITTEN
+    if FAIL_LOG_PATH and RUN_ID and not _RUN_END_WRITTEN:
+        try:
+            with open(FAIL_LOG_PATH, "a", encoding="utf-8") as fh:
+                fh.write(f"===== RUN END | run_id={RUN_ID} =====\n")
+            _RUN_END_WRITTEN = True
+        except Exception:
+            # Silently fail - don't interrupt exit
+            pass
 
 def log_total_failure(msg: str):
     global FAIL_LOG_PATH, RUN_LOG_DIR
