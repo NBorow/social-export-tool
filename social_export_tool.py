@@ -32,7 +32,7 @@ except ImportError:
 	Pushbullet = None  # type: ignore
 
 # Import database functions
-from db import init_db, is_downloaded, get_post, get_existing_downloads, record_download, record_failure, get_download_stats, close_db, get_recent_download_timestamps
+from db import init_db, is_downloaded, get_post, get_existing_downloads, record_download, record_failure, get_download_stats, close_db, get_recent_download_timestamps, get_all_downloaded_shortcodes_with_source
 
 # --- Shutdown + cancelable sleep helpers ---
 SHUTDOWN = threading.Event()
@@ -400,6 +400,21 @@ _SOURCE_EFFECTIVE_PRIORITY: dict[tuple[str, bool], int] = {
 def _source_priority(source: str, collection: str | None) -> int:
     is_unsorted = source == "saved" and (not collection or collection == UNSORTED_COLLECTION_DIRNAME)
     return _SOURCE_EFFECTIVE_PRIORITY.get((source, is_unsorted), 99)
+
+def build_downloaded_map(conn) -> dict:
+    """
+    Build {shortcode: best_effective_priority} from the DB in one query.
+    Used at session start so per-post skip checks are O(1) dict lookups
+    instead of per-post DB queries, and so skips never touch the pacer.
+    """
+    records = get_all_downloaded_shortcodes_with_source(conn)
+    result = {}
+    for r in records:
+        ep = _source_priority(r['source'], r.get('collection'))
+        sc = r['shortcode']
+        if sc not in result or ep < result[sc]:
+            result[sc] = ep
+    return result
 
 # --- Safety Settings ---
 SAFETY_KEYS = [
@@ -1653,7 +1668,7 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 		SESSION_TRACKER.record_download_skip()
 		PROGRESS.on_skip()  # Update progress BEFORE taking snapshot
 		log_line(f"[SKIPPED] {shortcode} already recorded", snapshot=True)
-		return True
+		return "skipped"
 	
 	# Record download attempt
 	SESSION_TRACKER.record_download_attempt()
@@ -2122,7 +2137,8 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
         bool: True if any posts were downloaded successfully
     """
     print(f"[PROFILE] Downloading all posts from @{username}")
-    
+    downloaded_map = build_downloaded_map(conn)
+
     try:
         # First, get all post URLs from the profile using Selenium
         result = get_profile_post_urls(username)
@@ -2159,7 +2175,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                 continue
             
             # Check if already downloaded
-            if is_downloaded(conn, shortcode):
+            if shortcode in downloaded_map:
                 log_line(f"[SKIP] {shortcode} already downloaded for @{username}", snapshot=True)
                 skipped_count += 1
                 continue
@@ -2183,11 +2199,11 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
             while True:
                 try:
                     ok = download_post(conn, post_data_dict, profile_dir, pacer, config)
-                    # success or non-block failure -> break to next item
-                    if ok:
+                    if ok is True:
                         successful_downloads += 1
+                        downloaded_map[shortcode] = _source_priority(source, None)
                         print(f"[SUCCESS] Downloaded post {i}/{len(post_urls)} for @{username}")
-                    else:
+                    elif not ok:
                         print(f"[FAILED] Post {i}/{len(post_urls)} for @{username}")
                     break
                 except RateLimitError as e:
@@ -2381,6 +2397,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
         is_all_conversations = len(selected_files) > 1
         total_conversations = len(selected_files)
         progress_started = False
+        downloaded_map = build_downloaded_map(conn)
 
         for conv_idx, msg_file in enumerate(selected_files, 1):
             thread_name = os.path.basename(os.path.dirname(msg_file))
@@ -2481,29 +2498,30 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
                 # Priority check: if already filed under a higher-priority source, skip or refile
                 shortcode = post.get('shortcode')
                 if shortcode:
-                    existing = get_existing_downloads(conn, shortcode)
-                    if existing:
-                        best_ep = min(_source_priority(r['source'], r.get('collection')) for r in existing)
-                        current_ep = _source_priority(post.get('source', 'dm'), post.get('_collection'))
-                        if current_ep > best_ep:
+                    current_ep = _source_priority(post.get('source', 'dm'), post.get('_collection'))
+                    if shortcode in downloaded_map:
+                        best_ep = downloaded_map[shortcode]
+                        if current_ep >= best_ep:
                             SESSION_TRACKER.record_download_skip()
                             PROGRESS.on_skip()
-                            log_line(f"[SKIP] {shortcode} already filed under higher-priority source", snapshot=True)
+                            log_line(f"[SKIP] {shortcode} already filed under equal or higher-priority source", snapshot=True)
                             continue
                         elif current_ep < best_ep:
+                            existing = get_existing_downloads(conn, shortcode)
                             log_line(f"[REFILE] {shortcode} moving to higher-priority location: {thread_dir}", snapshot=True)
                             refile_post(conn, post, existing)
+                            del downloaded_map[shortcode]
                             # fall through — retry loop re-downloads to thread_dir, handles rate limits
-                        # same priority — fall through to download_post which handles via inner check
 
                 # Use our existing download method with exception handling
                 retry_count = 0
                 while True:
                     try:
                         ok = download_post(conn, post, thread_dir, pacer, config)
-                        # success or non-block failure -> break to next item
-                        if ok:
+                        if ok is True:
                             total_posts += 1
+                            if shortcode:
+                                downloaded_map[shortcode] = current_ep
                         break
                     except RateLimitError as e:
                         print(f"\n[BLOCK] Rate limited.")
@@ -2651,6 +2669,7 @@ def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 			filtered.append(p)
 
 	print(f"Found {len(filtered)} liked post(s). Starting downloads...")
+	downloaded_map = build_downloaded_map(conn)
 	PROGRESS.start(len(filtered))
 	try:
 
@@ -2663,26 +2682,27 @@ def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 			if not shortcode:
 				continue
 
-			existing = get_existing_downloads(conn, shortcode)
-			if existing:
-				best_ep = min(_source_priority(r['source'], r.get('collection')) for r in existing)
-				current_ep = _source_priority(post.get('source', 'liked'), post.get('_collection'))
+			current_ep = _source_priority(post.get('source', 'liked'), post.get('_collection'))
+			if shortcode in downloaded_map:
+				best_ep = downloaded_map[shortcode]
 				if current_ep >= best_ep:
 					SESSION_TRACKER.record_download_skip()
 					PROGRESS.on_skip()
 					log_line(f"[SKIP] {shortcode} already downloaded under equal or higher-priority source", snapshot=True)
 					continue
 				# liked is higher priority than existing — unlikely given the ordering but handle it
+				existing = get_existing_downloads(conn, shortcode)
 				log_line(f"[REFILE] {shortcode} moving to higher-priority location", snapshot=True)
 				refile_post(conn, post, existing)
+				del downloaded_map[shortcode]
 				# fall through — retry loop re-downloads to target_dir, handles rate limits
 
 			retry_count = 0
 			while True:
 				try:
 					ok = download_post(conn, post, target_dir, pacer, config)
-					if ok and pacer:
-						pacer.after_success()
+					if ok is True:
+						downloaded_map[shortcode] = current_ep
 					break
 
 				except RateLimitError:
@@ -2779,6 +2799,7 @@ def process_reposts_for_dump(conn, dump_path: str, pacer, safety_config: dict, c
 	filtered = [p for p in posts if p.get('shortcode') and p['shortcode'] not in seen and not seen.add(p['shortcode'])]
 
 	print(f"Found {len(filtered)} repost(s). Starting downloads...")
+	downloaded_map = build_downloaded_map(conn)
 	PROGRESS.start(len(filtered))
 	try:
 		for post in filtered:
@@ -2787,25 +2808,26 @@ def process_reposts_for_dump(conn, dump_path: str, pacer, safety_config: dict, c
 				return False
 
 			shortcode = post['shortcode']
-			existing = get_existing_downloads(conn, shortcode)
-			if existing:
-				best_ep = min(_source_priority(r['source'], r.get('collection')) for r in existing)
-				current_ep = _source_priority('reposts', None)
-				if current_ep > best_ep:
+			current_ep = _source_priority('reposts', None)
+			if shortcode in downloaded_map:
+				best_ep = downloaded_map[shortcode]
+				if current_ep >= best_ep:
 					SESSION_TRACKER.record_download_skip()
 					PROGRESS.on_skip()
 					log_line(f"[SKIP] {shortcode} already filed under higher-priority source", snapshot=True)
 					continue
 				elif current_ep < best_ep:
+					existing = get_existing_downloads(conn, shortcode)
 					log_line(f"[REFILE] {shortcode} moving to reposts folder", snapshot=True)
 					refile_post(conn, post, existing)
+					del downloaded_map[shortcode]
 
 			retry_count = 0
 			while True:
 				try:
 					ok = download_post(conn, post, target_dir, pacer, config)
-					if ok and pacer:
-						pacer.after_success()
+					if ok is True:
+						downloaded_map[shortcode] = current_ep
 					break
 				except RateLimitError:
 					SESSION_TRACKER.record_rate_limit()
@@ -2911,6 +2933,7 @@ def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 
 	print(f"Found {len(all_posts)} saved post(s). Starting downloads...")
 	download_base_dir = config.get("DOWNLOAD_DIRECTORY", os.path.join(os.path.dirname(__file__), "downloads"))
+	downloaded_map = build_downloaded_map(conn)
 	PROGRESS.start(len(all_posts))
 	try:
 		for i, post in enumerate(all_posts, 1):
@@ -2923,27 +2946,27 @@ def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 			collection_name = post.get("_collection") or UNSORTED_COLLECTION_DIRNAME
 			target_dir = ensure_collection_dir(download_base_dir, collection_name)
 
-			existing = get_existing_downloads(conn, shortcode)
-			if existing:
-				best_ep = min(_source_priority(r['source'], r.get('collection')) for r in existing)
-				current_ep = _source_priority(post.get('source', 'saved'), post.get('_collection'))
-				if current_ep > best_ep:
+			current_ep = _source_priority(post.get('source', 'saved'), post.get('_collection'))
+			if shortcode in downloaded_map:
+				best_ep = downloaded_map[shortcode]
+				if current_ep >= best_ep:
 					SESSION_TRACKER.record_download_skip()
 					PROGRESS.on_skip()
-					log_line(f"[SKIP] {shortcode} already filed under higher-priority source", snapshot=True)
+					log_line(f"[SKIP] {shortcode} already filed under equal or higher-priority source", snapshot=True)
 					continue
-				elif current_ep < best_ep:
-					log_line(f"[REFILE] {shortcode} moving to higher-priority location: {collection_name}", snapshot=True)
-					refile_post(conn, post, existing)
-					# fall through — retry loop re-downloads to target_dir, handles rate limits
-				# same priority — fall through, download_post inner check will skip
+				# current is higher priority — refile
+				existing = get_existing_downloads(conn, shortcode)
+				log_line(f"[REFILE] {shortcode} moving to higher-priority location: {collection_name}", snapshot=True)
+				refile_post(conn, post, existing)
+				del downloaded_map[shortcode]
+				# fall through — retry loop re-downloads to target_dir, handles rate limits
 
 			retry_count = 0
 			while True:
 				try:
 					ok = download_post(conn, post, target_dir, pacer, config)
-					if ok and pacer:
-						pacer.after_success()
+					if ok is True:
+						downloaded_map[shortcode] = current_ep
 					break
 
 				except RateLimitError:

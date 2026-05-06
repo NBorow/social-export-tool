@@ -287,6 +287,14 @@ def close_db(conn: sqlite3.Connection):
         conn.close()
 
 
+def get_all_downloaded_shortcodes_with_source(conn: sqlite3.Connection) -> list:
+    """Return (shortcode, source, collection) for every successfully downloaded post."""
+    cursor = conn.execute(
+        'SELECT shortcode, source, collection FROM posts WHERE status = "success"'
+    )
+    return [{'shortcode': r[0], 'source': r[1], 'collection': r[2]} for r in cursor.fetchall()]
+
+
 def get_recent_download_timestamps(conn: sqlite3.Connection, since_epoch_seconds: float) -> list:
     try:
         cursor = conn.execute('''
