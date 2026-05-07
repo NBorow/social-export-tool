@@ -32,7 +32,12 @@ except ImportError:
 	Pushbullet = None  # type: ignore
 
 # Import database functions
-from db import init_db, is_downloaded, get_post, get_existing_downloads, record_download, record_failure, get_download_stats, close_db, get_recent_download_timestamps, get_all_downloaded_shortcodes_with_source
+from db import (
+    init_db, is_downloaded, get_post, get_existing_downloads,
+    record_download, record_failure, get_download_stats, close_db,
+    get_recent_download_timestamps, get_all_downloaded_shortcodes_with_source,
+    is_probably_deleted, mark_probably_deleted, clear_probably_deleted, get_probably_deleted_posts,
+)
 
 # --- Shutdown + cancelable sleep helpers ---
 SHUTDOWN = threading.Event()
@@ -308,9 +313,14 @@ def classify_block_reason(stderr: str):
         return "checkpoint"
     if any(p in s for p in ["login required", "please log in", "not logged in"]):
         return "login_required"
-    # NEW: explicit not-found/private detection
+    # Restricted-audience phrase: explicitly not probably_deleted or not_found
+    if "this content isn't available to everyone" in s:
+        return None
+    # Probably-deleted: IG returned empty media response (post no longer accessible)
+    if "instagram sent an empty media response" in s:
+        return "probably_deleted"
+    # Other not-found/private/gone signals
     if any(p in s for p in [
-        "instagram sent an empty media response",
         "not found",
         "content unavailable",
         "media missing",
@@ -320,7 +330,7 @@ def classify_block_reason(stderr: str):
         "410"
     ]):
         return "not_found"
-    # Existing rate-limit markers
+    # Rate-limit markers
     if any(p in s for p in [
         "429",
         "rate limit",
@@ -1624,25 +1634,83 @@ def extract_dm_posts_and_profiles(dm_json_path, thread_name=None):
     
     return posts, profiles, send_text_hits
 
-def refile_post(conn, post: dict, existing_records: list[dict]) -> None:
+def refile_post(conn, post: dict, existing_records: list[dict], target_dir: str) -> bool:
 	"""
-	Delete old file(s) and all DB records for a shortcode so the caller's
-	retry loop can re-download it to the correct higher-priority location.
+	Move existing downloaded file(s) for a shortcode into a higher-priority
+	location without re-downloading from Instagram.
+
+	Returns True if at least one file was moved and DB updated; otherwise False.
 	"""
 	shortcode = post.get('shortcode', '?')
+	if not target_dir:
+		return False
+	os.makedirs(target_dir, exist_ok=True)
+
+	moved_paths = []
+	seen_sources: set[str] = set()
 	for rec in existing_records:
 		old_path = rec.get('local_path')
-		if old_path and os.path.exists(old_path):
+		if not old_path:
+			continue
+		old_dir = os.path.dirname(old_path)
+		if not old_dir:
+			continue
+		if old_dir in seen_sources:
+			# We move by shortcode prefix per-directory, so only do this once per dir
+			continue
+		seen_sources.add(old_dir)
+
+		# Move the primary file plus any siblings for this shortcode (carousel parts, sidecars).
+		# Filenames created by this tool always begin with the shortcode.
+		pattern = os.path.join(old_dir, f"{shortcode}*")
+		candidates = [p for p in glob(pattern) if os.path.isfile(p)]
+		# If glob returns nothing (unexpected), fall back to the specific path.
+		if not candidates and os.path.isfile(old_path):
+			candidates = [old_path]
+
+		for src in sorted(set(candidates)):
 			try:
-				os.remove(old_path)
-				log_line(f"[REFILE] Removed old file: {old_path}", snapshot=False)
-			except OSError as e:
-				log_line(f"[REFILE] Could not remove {old_path}: {e}", snapshot=False)
-	conn.execute('DELETE FROM posts WHERE shortcode = ?', (shortcode,))
-	conn.commit()
+				base = os.path.basename(src)
+				# Extra guard: only move files that actually start with the shortcode
+				if not base.startswith(shortcode):
+					continue
+				dst = os.path.join(target_dir, base)
+				# Avoid overwrite if a file already exists
+				if os.path.exists(dst):
+					root, ext = os.path.splitext(base)
+					i = 2
+					while True:
+						candidate = os.path.join(target_dir, f"{root}__moved{i}{ext}")
+						if not os.path.exists(candidate):
+							dst = candidate
+							break
+						i += 1
+				shutil.move(src, dst)
+				moved_paths.append(dst)
+				log_line(f"[REFILE] Moved {src} -> {dst}", snapshot=False)
+			except Exception as e:
+				log_line(f"[REFILE] Could not move {src}: {e}", snapshot=False)
+
+	if not moved_paths:
+		return False
+
+	# Enforce canonical single-copy semantics in DB: drop old *successful* rows
+	# for this shortcode, then record a success row for the new higher-priority source.
+	try:
+		conn.execute('DELETE FROM posts WHERE shortcode = ? AND status = "success"', (shortcode,))
+		conn.commit()
+	except Exception:
+		pass
+
+	# Record as success for the new source with the moved path (pick last moved file)
+	representative_path = moved_paths[-1]
+	status = record_download(conn, post, representative_path)
+	if status != "error":
+		return True
+	return False
 
 
-def download_post(conn, post_data, download_dir, pacer=None, config=None):
+def download_post(conn, post_data, download_dir, pacer=None, config=None, ignore_probably_deleted: bool = False):
 	"""
 	Download a single Instagram post using yt-dlp with fallback to gallery-dl.
 	
@@ -1666,10 +1734,21 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 	# Check if already downloaded
 	if is_downloaded(conn, shortcode):
 		SESSION_TRACKER.record_download_skip()
-		PROGRESS.on_skip()  # Update progress BEFORE taking snapshot
+		PROGRESS.on_skip()
 		log_line(f"[SKIPPED] {shortcode} already recorded", snapshot=True)
 		return "skipped"
-	
+
+	# Skip without network call if this post is flagged probably_deleted for this source.
+	# Retry workflows can override this check via ignore_probably_deleted=True.
+	source = post_data.get('source')
+	if (not ignore_probably_deleted) and is_probably_deleted(conn, shortcode, source):
+		SESSION_TRACKER.record_download_skip()
+		SESSION_TRACKER.record_skipped_prob_deleted()
+		PROGRESS.on_skip()
+		PROGRESS.on_prob_skip()
+		log_line(f"[PROB_DEL] {shortcode} skipped — marked probably_deleted", snapshot=True)
+		return "skipped"
+
 	# Record download attempt
 	SESSION_TRACKER.record_download_attempt()
 	
@@ -1713,6 +1792,12 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 			pacer.after_success()
 		return True
 	
+	# Track qualifying probably-deleted signals per tool.
+	# Only mark probably_deleted when BOTH tools emit the signal.
+	yt_prob_del_signal = False
+	gallery_prob_del_signal = False
+	_prob_del_reason = "Instagram empty media response"
+
 	# Try yt-dlp first
 	try:
 		cmd = [
@@ -1739,10 +1824,21 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 				raise CheckpointError(result.stderr or "checkpoint")
 			elif reason == "login_required":
 				raise LoginRequiredError(result.stderr or "login required")
+			elif reason == "probably_deleted":
+				yt_prob_del_signal = True
+				log_line(f"yt-dlp probably_deleted signal for {shortcode}, trying gallery-dl...", snapshot=False)
 			elif reason == "not_found":
 				raise NotFoundError(result.stderr or "not found/private")
-		
+
 		if result.returncode == 0:
+			# Clear probably_deleted state on successful download.
+			# Prefer exact row-id clears in retry flows; otherwise clear by shortcode+source.
+			pd_id = post_data.get('id')
+			pd_source = post_data.get('source')
+			if pd_id is not None:
+				clear_probably_deleted(conn, shortcode, record_id=pd_id)
+			elif pd_source:
+				clear_probably_deleted(conn, shortcode, pd_source)
 			# extract final path from stdout (last non-empty line)
 			std_lines = [l for l in result.stdout.splitlines() if l.strip()]
 			saved_path = std_lines[-1].strip() if std_lines else None
@@ -1836,10 +1932,21 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 				raise CheckpointError(result.stderr or "checkpoint")
 			elif reason == "login_required":
 				raise LoginRequiredError(result.stderr or "login required")
+			elif reason == "probably_deleted":
+				gallery_prob_del_signal = True
+				log_line(f"gallery-dl probably_deleted signal for {shortcode}", snapshot=False)
 			elif reason == "not_found":
 				raise NotFoundError(result.stderr or "not found/private")
-		
+
 		if result.returncode == 0:
+			# Clear probably_deleted state on successful download.
+			# Prefer exact row-id clears in retry flows; otherwise clear by shortcode+source.
+			pd_id = post_data.get('id')
+			pd_source = post_data.get('source')
+			if pd_id is not None:
+				clear_probably_deleted(conn, shortcode, record_id=pd_id)
+			elif pd_source:
+				clear_probably_deleted(conn, shortcode, pd_source)
 			# collect all absolute-looking paths gallery-dl printed
 			candidates = [l.strip() for l in result.stdout.splitlines() if is_abs_pathish(l)]
 			saved_path = candidates[-1] if candidates else None
@@ -1917,7 +2024,24 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 	except Exception as e:
 		log_line(f"gallery-dl error for {shortcode}: {e}", snapshot=False)
     
-	# Record failure
+	# Probably-deleted: IG signalled empty media in BOTH tools.
+	if yt_prob_del_signal and gallery_prob_del_signal:
+		status = mark_probably_deleted(conn, post_data, _prob_del_reason)
+		SESSION_TRACKER.record_download_failure()
+		SESSION_TRACKER.record_newly_prob_deleted()
+		SESSION_TRACKER.record_error(f"ProbDel: {shortcode} - {_prob_del_reason}")
+		PROGRESS.on_failure()
+		PROGRESS.on_prob_new()
+		log_line(f"[PROB_DEL_NEW] {shortcode} marked probably_deleted ({_prob_del_reason})", snapshot=True)
+		try:
+			from datetime import datetime as _dt
+			timestamp = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+			log_total_failure(f"[{timestamp}] {shortcode} [PROB_DEL] {_prob_del_reason} - URL: {url}")
+		except Exception:
+			pass
+		return False
+
+	# Generic failure: both tools failed for other reasons
 	error_msg = f"Both yt-dlp and gallery-dl failed to download {shortcode}"
 	status = record_failure(conn, post_data, error_msg)
 	if status == "inserted":
@@ -2508,10 +2632,18 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
                             continue
                         elif current_ep < best_ep:
                             existing = get_existing_downloads(conn, shortcode)
-                            log_line(f"[REFILE] {shortcode} moving to higher-priority location: {thread_dir}", snapshot=True)
-                            refile_post(conn, post, existing)
+                            log_line(f"[REFILE] {shortcode} promoting to higher-priority location: {thread_dir}", snapshot=True)
+                            if refile_post(conn, post, existing, thread_dir):
+                                # We moved existing file(s) and updated DB; no network download needed.
+                                downloaded_map[shortcode] = current_ep
+                                SESSION_TRACKER.record_refile_completed()
+                                SESSION_TRACKER.record_download_skip()
+                                PROGRESS.on_skip()
+                                PROGRESS.on_refile()
+                                log_line(f"[REFILE] {shortcode} promotion complete (moved, no re-download)", snapshot=True)
+                                continue
+                            # If move failed (no local files), fall through to re-download.
                             del downloaded_map[shortcode]
-                            # fall through — retry loop re-downloads to thread_dir, handles rate limits
 
                 # Use our existing download method with exception handling
                 retry_count = 0
@@ -2692,10 +2824,16 @@ def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 					continue
 				# liked is higher priority than existing — unlikely given the ordering but handle it
 				existing = get_existing_downloads(conn, shortcode)
-				log_line(f"[REFILE] {shortcode} moving to higher-priority location", snapshot=True)
-				refile_post(conn, post, existing)
+				log_line(f"[REFILE] {shortcode} promoting to higher-priority location", snapshot=True)
+				if refile_post(conn, post, existing, target_dir):
+					downloaded_map[shortcode] = current_ep
+					SESSION_TRACKER.record_refile_completed()
+					SESSION_TRACKER.record_download_skip()
+					PROGRESS.on_skip()
+					PROGRESS.on_refile()
+					log_line(f"[REFILE] {shortcode} promotion complete (moved, no re-download)", snapshot=True)
+					continue
 				del downloaded_map[shortcode]
-				# fall through — retry loop re-downloads to target_dir, handles rate limits
 
 			retry_count = 0
 			while True:
@@ -2818,8 +2956,15 @@ def process_reposts_for_dump(conn, dump_path: str, pacer, safety_config: dict, c
 					continue
 				elif current_ep < best_ep:
 					existing = get_existing_downloads(conn, shortcode)
-					log_line(f"[REFILE] {shortcode} moving to reposts folder", snapshot=True)
-					refile_post(conn, post, existing)
+					log_line(f"[REFILE] {shortcode} promoting to reposts folder", snapshot=True)
+					if refile_post(conn, post, existing, target_dir):
+						downloaded_map[shortcode] = current_ep
+						SESSION_TRACKER.record_refile_completed()
+						SESSION_TRACKER.record_download_skip()
+						PROGRESS.on_skip()
+						PROGRESS.on_refile()
+						log_line(f"[REFILE] {shortcode} promotion complete (moved, no re-download)", snapshot=True)
+						continue
 					del downloaded_map[shortcode]
 
 			retry_count = 0
@@ -2956,10 +3101,16 @@ def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 					continue
 				# current is higher priority — refile
 				existing = get_existing_downloads(conn, shortcode)
-				log_line(f"[REFILE] {shortcode} moving to higher-priority location: {collection_name}", snapshot=True)
-				refile_post(conn, post, existing)
+				log_line(f"[REFILE] {shortcode} promoting to higher-priority location: {collection_name}", snapshot=True)
+				if refile_post(conn, post, existing, target_dir):
+					downloaded_map[shortcode] = current_ep
+					SESSION_TRACKER.record_refile_completed()
+					SESSION_TRACKER.record_download_skip()
+					PROGRESS.on_skip()
+					PROGRESS.on_refile()
+					log_line(f"[REFILE] {shortcode} promotion complete (moved, no re-download)", snapshot=True)
+					continue
 				del downloaded_map[shortcode]
-				# fall through — retry loop re-downloads to target_dir, handles rate limits
 
 			retry_count = 0
 			while True:
@@ -3097,6 +3248,7 @@ def print_page(dumps, dump_availability, page):
         if page > 0:
             print("p) Previous page")
     print("c) Config Menu")
+    print("r) Retry all probably_deleted posts")
     print("q) Quit")
 
 def print_options_menu(avail):
@@ -3259,6 +3411,104 @@ def settings_menu():
         else:
             print("Invalid choice. Please try again.")
 
+def process_probably_deleted_retry(conn, pacer, safety_config, config, notifier=None):
+    """Retry all posts marked probably_deleted in deterministic order."""
+    posts = get_probably_deleted_posts(conn)
+    if not posts:
+        print("\nNo probably_deleted posts to retry.")
+        input("Press Enter to continue...")
+        return
+
+    download_base_dir = config.get('DOWNLOAD_DIRECTORY', os.path.join(os.path.dirname(__file__), 'downloads'))
+    target_dir = os.path.join(download_base_dir, 'prob_deleted_retry')
+    os.makedirs(target_dir, exist_ok=True)
+
+    print(f"\n[PROB_DEL_RETRY] Retrying {len(posts)} probably_deleted post(s)...")
+    print(f"[PROB_DEL_RETRY] Output dir: {target_dir}")
+
+    PROGRESS.start(len(posts))
+    recovered = 0
+    failed_attempts = 0
+    try:
+        for post in posts:
+            if SHUTDOWN.is_set():
+                print("[PROB_DEL_RETRY] Shutdown requested, stopping.")
+                break
+
+            shortcode = post.get('shortcode', '?')
+
+            retry_count = 0
+            while True:
+                try:
+                    ok = download_post(
+                        conn, post, target_dir, pacer, config,
+                        ignore_probably_deleted=True
+                    )
+                    if ok is True:
+                        recovered += 1
+                        log_line(f"[PROB_DEL_RETRY] {shortcode} recovered successfully", snapshot=True)
+                    else:
+                        failed_attempts += 1
+                    break
+
+                except RateLimitError:
+                    SESSION_TRACKER.record_rate_limit()
+                    base_delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE) - 1)]
+                    delay = get_jittered_delay(base_delay)
+                    print(f"[BLOCK] Rate limited. Retrying in {delay}s.")
+                    if wait_with_progress("Rate limit", delay):
+                        return
+                    retry_count += 1
+
+                except CheckpointError:
+                    print("[BLOCK] Checkpoint encountered during prob_del retry.")
+                    resp = input("[Enter]=retry  |  S=skip  |  Q=quit > ").strip().lower()
+                    log_user_input("PROB_DEL_CHECKPOINT_MENU", resp)
+                    if resp == "q":
+                        return
+                    if resp == "s":
+                        mark_probably_deleted(conn, post, "Skipped during checkpoint (retry)")
+                        failed_attempts += 1
+                        break
+
+                except LoginRequiredError:
+                    print("[BLOCK] Login required during prob_del retry.")
+                    resp = input("[M]=manual login  |  S=skip  |  Q=quit > ").strip().lower()
+                    log_user_input("PROB_DEL_LOGIN_MENU", resp)
+                    if resp == "q":
+                        return
+                    if resp == "s":
+                        mark_probably_deleted(conn, post, "Skipped after login-required (retry)")
+                        failed_attempts += 1
+                        break
+                    if resp == "m":
+                        _cfg = read_config()
+                        _pd, _cf = resolve_profile_and_cookie(_cfg)
+                        manual_login_and_export_cookies(_pd, _cf)
+
+                except NotFoundError:
+                    log_line(f"[PROB_DEL_RETRY] {shortcode} confirmed unavailable (NotFound)", snapshot=True)
+                    mark_probably_deleted(conn, post, "Confirmed unavailable on retry")
+                    failed_attempts += 1
+                    PROGRESS.on_failure()
+                    break
+
+    finally:
+        PROGRESS.finish()
+
+    remaining_prob_deleted = len(get_probably_deleted_posts(conn))
+    print(
+        f"\n[PROB_DEL_RETRY] Complete. Recovered: {recovered}, "
+        f"Failed attempts: {failed_attempts}, Remaining prob-deleted: {remaining_prob_deleted}"
+    )
+    if notifier is not None:
+        notifier(
+            "Instagram Export – Prob-Del Retry",
+            f"Retry complete. Recovered: {recovered}, Remaining prob-deleted: {remaining_prob_deleted}"
+        )
+    input("Press Enter to continue...")
+
+
 def main():
     config = read_config()
     
@@ -3328,11 +3578,11 @@ def main():
         while True:
             print_page(dumps, dump_availability, page)
             if len(dumps) > PAGE_SIZE:
-                prompt_msg = "Enter your choice (number, n, p, c, q): "
-                invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, 'n', 'p', 'c', or 'q'."
+                prompt_msg = "Enter your choice (number, n, p, c, r, q): "
+                invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, 'n', 'p', 'c', 'r', or 'q'."
             else:
-                prompt_msg = "Enter your choice (number, c, q): "
-                invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, 'c', or 'q'."
+                prompt_msg = "Enter your choice (number, c, r, q): "
+                invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, 'c', 'r', or 'q'."
             
             choice = input(prompt_msg).strip().lower()
             log_user_input("MAIN_MENU_DUMP_SELECT", choice)
@@ -3459,6 +3709,8 @@ def main():
                 safety_config = get_safety_config()
                 recent_timestamps = get_recent_download_timestamps(conn, time.time() - 86400)
                 pacer = SafetyPacer(safety_config, recent_timestamps)
+            elif choice == 'r':
+                process_probably_deleted_retry(conn, pacer, safety_config, config, notifier)
             elif choice == 'q':
                 print("Quitting.")
                 break
@@ -3543,6 +3795,9 @@ class ProgressRenderer:
 		self.success = 0
 		self.failure = 0
 		self.skipped = 0
+		self.prob_skip = 0
+		self.prob_new = 0
+		self.refiled = 0
 		self.start_ts = time.time()
 		self.active = False
 
@@ -3582,6 +3837,24 @@ class ProgressRenderer:
 		self.failure += 1
 		self.render()
 
+	def on_prob_skip(self):
+		if not self.active:
+			return
+		self.prob_skip += 1
+		self.render()
+
+	def on_prob_new(self):
+		if not self.active:
+			return
+		self.prob_new += 1
+		self.render()
+
+	def on_refile(self):
+		if not self.active:
+			return
+		self.refiled += 1
+		self.render()
+
 	def log(self, msg: str):
 		"""Print a scrolling log line while keeping the sticky bar intact."""
 		if self.active:
@@ -3605,7 +3878,7 @@ class ProgressRenderer:
 		bar = self._bar(current, total)
 		elapsed = self._fmt_elapsed(time.time() - self.start_ts)
 		total_display = str(self.total) if self.total > 0 else "?"
-		line = f"[Overall] {current}/{total_display} ({percent:.1f}%) {bar}  Elapsed {elapsed}  OK:{self.success} Fail:{self.failure} Skip:{self.skipped}"
+		line = f"[Overall] {current}/{total_display} ({percent:.1f}%) {bar}  Elapsed {elapsed}  OK:{self.success} Fail:{self.failure} Skip:{self.skipped} PSkip:{self.prob_skip} PNew:{self.prob_new} Refile:{self.refiled}"
 		line = line[:width - 1]
 		print("\r" + line.ljust(width - 1), end='', flush=True)
 
@@ -3622,7 +3895,7 @@ class ProgressRenderer:
 		bar = self._bar(display_count, total)
 		elapsed = self._fmt_elapsed(time.time() - self.start_ts)
 		total_display = str(self.total) if self.total > 0 else "?"
-		line = f"[Overall] {display_count}/{total_display} ({percent:.1f}%) {bar}  Elapsed {elapsed}  OK:{self.success} Fail:{self.failure} Skip:{self.skipped}"
+		line = f"[Overall] {display_count}/{total_display} ({percent:.1f}%) {bar}  Elapsed {elapsed}  OK:{self.success} Fail:{self.failure} Skip:{self.skipped} PSkip:{self.prob_skip} PNew:{self.prob_new} Refile:{self.refiled}"
 		return line[:width - 1].ljust(width - 1)
 
 	def render_line_live(self) -> str:
@@ -3640,7 +3913,7 @@ class ProgressRenderer:
 		bar = self._bar(current, total)  # Show current item for live bar
 		elapsed = self._fmt_elapsed(time.time() - self.start_ts)
 		total_display = str(self.total) if self.total > 0 else "?"
-		line = f"[Overall] {current}/{total_display} ({percent:.1f}%) {bar}  Elapsed {elapsed}  OK:{self.success} Fail:{self.failure} Skip:{self.skipped}"
+		line = f"[Overall] {current}/{total_display} ({percent:.1f}%) {bar}  Elapsed {elapsed}  OK:{self.success} Fail:{self.failure} Skip:{self.skipped} PSkip:{self.prob_skip} PNew:{self.prob_new} Refile:{self.refiled}"
 		return line[:width - 1].ljust(width - 1)
 
 	def _bar(self, done: int, total: int) -> str:
@@ -3674,6 +3947,9 @@ class SessionTracker:
 		self.rate_limits_hit = 0
 		self.checkpoints_hit = 0
 		self.login_required_hits = 0
+		self.skipped_prob_deleted = 0
+		self.newly_prob_deleted = 0
+		self.refiles_completed = 0
 		self.errors = []
 		self.dry_run = False
 	
@@ -3701,9 +3977,18 @@ class SessionTracker:
 	def record_login_required(self):
 		self.login_required_hits += 1
 	
+	def record_skipped_prob_deleted(self):
+		self.skipped_prob_deleted += 1
+
+	def record_newly_prob_deleted(self):
+		self.newly_prob_deleted += 1
+
+	def record_refile_completed(self):
+		self.refiles_completed += 1
+
 	def record_error(self, error_msg):
 		self.errors.append(error_msg)
-	
+
 	def get_session_summary(self):
 		"""Generate a comprehensive session summary."""
 		duration = time.time() - self.start_time
@@ -3724,6 +4009,9 @@ class SessionTracker:
 		summary.append(f"  • Successful: {self.downloads_successful}")
 		summary.append(f"  • Failed: {self.downloads_failed}")
 		summary.append(f"  • Skipped: {self.downloads_skipped}")
+		summary.append(f"  • Skipped (prob. deleted): {self.skipped_prob_deleted}")
+		summary.append(f"  • Newly marked prob. deleted: {self.newly_prob_deleted}")
+		summary.append(f"  • Refile promotions (moved, no re-download): {self.refiles_completed}")
 		
 		if self.downloads_attempted > 0:
 			success_rate = (self.downloads_successful / self.downloads_attempted) * 100

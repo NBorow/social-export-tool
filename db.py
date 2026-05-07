@@ -70,6 +70,24 @@ def init_db(db_path: str) -> sqlite3.Connection:
     except sqlite3.OperationalError:
         pass  # column already exists
 
+    # Migrate: add probably_deleted columns
+    for _col_sql in [
+        'ALTER TABLE posts ADD COLUMN is_probably_deleted INTEGER DEFAULT 0',
+        'ALTER TABLE posts ADD COLUMN probably_deleted_reason TEXT',
+        'ALTER TABLE posts ADD COLUMN probably_deleted_at DATETIME',
+    ]:
+        try:
+            conn.execute(_col_sql)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_posts_probably_deleted
+        ON posts(is_probably_deleted, shortcode)
+    ''')
+    conn.commit()
+
     # Backfill collection from local_path for old saved records.
     # Path structure: .../saved/<CollectionName>/<filename>
     # so os.path.basename(os.path.dirname(local_path)) gives the collection name.
@@ -171,7 +189,10 @@ def record_download(conn: sqlite3.Connection, post: Dict, local_path: Optional[s
                 username=excluded.username,
                 timestamp_ms=excluded.timestamp_ms,
                 dm_thread=excluded.dm_thread,
-                local_path=excluded.local_path
+                local_path=excluded.local_path,
+                is_probably_deleted=0,
+                probably_deleted_reason=NULL,
+                probably_deleted_at=NULL
         ''', (
             post.get('shortcode'),
             post.get('url'),
@@ -293,6 +314,110 @@ def get_all_downloaded_shortcodes_with_source(conn: sqlite3.Connection) -> list:
         'SELECT shortcode, source, collection FROM posts WHERE status = "success"'
     )
     return [{'shortcode': r[0], 'source': r[1], 'collection': r[2]} for r in cursor.fetchall()]
+
+
+def is_probably_deleted(conn: sqlite3.Connection, shortcode: str, source: str = None) -> bool:
+    """Return True if shortcode is marked probably_deleted (optionally scoped to source)."""
+    if source:
+        cursor = conn.execute(
+            'SELECT 1 FROM posts WHERE shortcode = ? AND source = ? AND is_probably_deleted = 1 LIMIT 1',
+            (shortcode, source)
+        )
+    else:
+        cursor = conn.execute(
+            'SELECT 1 FROM posts WHERE shortcode = ? AND is_probably_deleted = 1 LIMIT 1',
+            (shortcode,)
+        )
+    return cursor.fetchone() is not None
+
+
+def mark_probably_deleted(conn: sqlite3.Connection, post: Dict, reason: str) -> str:
+    """
+    Upsert a post record flagged as probably_deleted.
+    Sets status='failed', is_probably_deleted=1, records reason and timestamp.
+    """
+    short_reason = reason[:500] if reason else "probably_deleted"
+    try:
+        conn.execute('''
+            INSERT INTO posts (
+                shortcode, url, description, original_owner, caption,
+                source, username, timestamp_ms, status, error_message,
+                downloaded_at, dm_thread,
+                is_probably_deleted, probably_deleted_reason, probably_deleted_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'failed', ?, CURRENT_TIMESTAMP, ?, 1, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(shortcode, source) DO UPDATE SET
+                status='failed',
+                error_message=excluded.error_message,
+                downloaded_at=CURRENT_TIMESTAMP,
+                url=excluded.url,
+                description=excluded.description,
+                original_owner=excluded.original_owner,
+                caption=excluded.caption,
+                username=excluded.username,
+                timestamp_ms=excluded.timestamp_ms,
+                dm_thread=excluded.dm_thread,
+                is_probably_deleted=1,
+                probably_deleted_reason=excluded.probably_deleted_reason,
+                probably_deleted_at=CURRENT_TIMESTAMP
+        ''', (
+            post.get('shortcode'),
+            post.get('url'),
+            post.get('description'),
+            post.get('original_owner'),
+            post.get('caption'),
+            post.get('source'),
+            post.get('username'),
+            post.get('timestamp_ms'),
+            short_reason,
+            post.get('dm_thread'),
+            short_reason,
+        ))
+        conn.commit()
+        return "inserted"
+    except Exception as e:
+        print(f"Database error marking probably_deleted: {e}")
+        return "error"
+
+
+def clear_probably_deleted(conn: sqlite3.Connection, shortcode: str, source: str = None, record_id: int = None):
+    """Clear probably_deleted flags by record_id, or by shortcode+source."""
+    try:
+        if record_id is not None:
+            conn.execute(
+                'UPDATE posts SET is_probably_deleted=0, probably_deleted_reason=NULL, probably_deleted_at=NULL '
+                'WHERE id=?',
+                (record_id,)
+            )
+        elif source:
+            conn.execute(
+                'UPDATE posts SET is_probably_deleted=0, probably_deleted_reason=NULL, probably_deleted_at=NULL '
+                'WHERE shortcode=? AND source=?',
+                (shortcode, source)
+            )
+        else:
+            # Safety: avoid broad cross-source clears unless explicitly targeted.
+            return
+        conn.commit()
+    except Exception as e:
+        print(f"Database error clearing probably_deleted: {e}")
+
+
+def get_probably_deleted_posts(conn: sqlite3.Connection, source: str = None) -> list:
+    """Return all probably_deleted posts in deterministic order (oldest first, then by shortcode)."""
+    if source:
+        cursor = conn.execute(
+            'SELECT * FROM posts WHERE is_probably_deleted=1 AND source=? '
+            'ORDER BY probably_deleted_at ASC, shortcode ASC',
+            (source,)
+        )
+    else:
+        cursor = conn.execute(
+            'SELECT * FROM posts WHERE is_probably_deleted=1 '
+            'ORDER BY probably_deleted_at ASC, shortcode ASC'
+        )
+    colnames = [desc[0] for desc in cursor.description]
+    return [dict(zip(colnames, row)) for row in cursor.fetchall()]
 
 
 def get_recent_download_timestamps(conn: sqlite3.Connection, since_epoch_seconds: float) -> list:
