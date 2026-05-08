@@ -1793,7 +1793,8 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None, ignore
 		return True
 	
 	# Track qualifying probably-deleted signals per tool.
-	# Only mark probably_deleted when BOTH tools emit the signal.
+	# Mark probably_deleted when yt-dlp emits the empty-media signal.
+	# We still attempt gallery-dl fallback before final classification.
 	yt_prob_del_signal = False
 	gallery_prob_del_signal = False
 	_prob_del_reason = "Instagram empty media response"
@@ -2024,8 +2025,8 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None, ignore
 	except Exception as e:
 		log_line(f"gallery-dl error for {shortcode}: {e}", snapshot=False)
     
-	# Probably-deleted: IG signalled empty media in BOTH tools.
-	if yt_prob_del_signal and gallery_prob_del_signal:
+	# Probably-deleted: yt-dlp signalled Instagram empty media response.
+	if yt_prob_del_signal:
 		status = mark_probably_deleted(conn, post_data, _prob_del_reason)
 		SESSION_TRACKER.record_download_failure()
 		SESSION_TRACKER.record_newly_prob_deleted()
