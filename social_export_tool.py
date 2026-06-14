@@ -345,6 +345,7 @@ def classify_block_reason(stderr: str):
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.txt')
 COOKIE_FILE = os.path.join(os.path.dirname(__file__), 'insta_cookies.txt')
+PRESETS_FILE = os.path.join(os.path.dirname(__file__), 'presets.json')
 PAGE_SIZE = 10
 
 # --- Centralized Chrome options builder ---
@@ -2424,23 +2425,22 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
         print(f"[ERROR] Profile @{username} - {e}")
         return False
 
-def process_dm_download(conn, selected_path, pacer=None, safety_config=None, config=None, notifier=None):
+def process_dm_download(conn, selected_path, pacer=None, safety_config=None, config=None, notifier=None, preset_conversations=None):
     """
     Process DM downloads from a selected profile dump.
-    
-    Args:
-        conn: Database connection
-        selected_path: Path to the selected profile dump
-        pacer: SafetyPacer instance for rate limiting
-        
-    Returns:
-        bool: True if processing completed successfully
+
+    preset_conversations: list of thread folder names to download without prompting,
+                          or None for interactive selection. An empty list means nothing
+                          was found in this dump — returns True (graceful skip).
     """
     print("Processing DM downloads...")
     try:
         # Find message_1.json files in the inbox
         inbox_dir = os.path.join(selected_path, DM_INBOX_PATH)
         if not os.path.exists(inbox_dir):
+            if preset_conversations is not None:
+                print(f"  [PRESET] DM inbox not found in this dump, skipping.")
+                return True
             print(f"DM inbox directory not found: {inbox_dir}")
             return False
 
@@ -2450,59 +2450,75 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
                 message_files.append(os.path.join(root, 'message_1.json'))
 
         if not message_files:
+            if preset_conversations is not None:
+                print("  [PRESET] No DM conversations found in this dump, skipping.")
+                return True
             print("No message files found in DM inbox")
             return None  # Return to previous menu
 
         log_line(f"Found {len(message_files)} DM conversations", snapshot=False)
 
-        # Helper function to print a page of DM conversations
-        def print_dm_page(message_files, page):
-            start = page * PAGE_SIZE
-            end = start + PAGE_SIZE
-            page_items = message_files[start:end]
-            print("\nAvailable DM conversations ({} available):".format(len(message_files)))
-            for idx, msg_file in enumerate(page_items, start + 1):
-                thread_name = os.path.basename(os.path.dirname(msg_file))
-                print(f"{idx}. {thread_name}")
-            if len(message_files) > PAGE_SIZE:
-                if end < len(message_files):
-                    print("n) Next page")
-                if page > 0:
-                    print("p) Previous page")
-            print("a) Download all conversations")
-            print("b) Back to options menu")
-            print("q) Quit")
+        if preset_conversations is not None:
+            # Preset mode: match requested thread names against what's actually in this dump
+            thread_map = {os.path.basename(os.path.dirname(f)): f for f in message_files}
+            selected_files = []
+            for name in preset_conversations:
+                if name in thread_map:
+                    selected_files.append(thread_map[name])
+                else:
+                    print(f"  [PRESET] DM thread '{name}' not found in this dump, skipping.")
+            if not selected_files:
+                print("  [PRESET] None of the preset DM threads found in this dump, skipping.")
+                return True
+        else:
+            # Helper function to print a page of DM conversations
+            def print_dm_page(message_files, page):
+                start = page * PAGE_SIZE
+                end = start + PAGE_SIZE
+                page_items = message_files[start:end]
+                print("\nAvailable DM conversations ({} available):".format(len(message_files)))
+                for idx, msg_file in enumerate(page_items, start + 1):
+                    thread_name = os.path.basename(os.path.dirname(msg_file))
+                    print(f"{idx}. {thread_name}")
+                if len(message_files) > PAGE_SIZE:
+                    if end < len(message_files):
+                        print("n) Next page")
+                    if page > 0:
+                        print("p) Previous page")
+                print("a) Download all conversations")
+                print("b) Back to options menu")
+                print("q) Quit")
 
-        # Get user selection with pagination
-        page = 0
-        selected_files = None
-        while selected_files is None:
-            print_dm_page(message_files, page)
-            choice = input("\nSelect which conversation(s) to download (number, 'a' for all, 'b' for back, 'n'/'p' for pages, or 'q' to quit): ").strip().lower()
-            log_user_input("DM_CONVERSATION_SELECT", choice)
+            # Get user selection with pagination
+            page = 0
+            selected_files = None
+            while selected_files is None:
+                print_dm_page(message_files, page)
+                choice = input("\nSelect which conversation(s) to download (number, 'a' for all, 'b' for back, 'n'/'p' for pages, or 'q' to quit): ").strip().lower()
+                log_user_input("DM_CONVERSATION_SELECT", choice)
 
-            if choice == 'q':
-                print("Quitting.")
-                return False
-            elif choice == 'b':
-                print("Returning to options menu.")
-                return None  # Special return value to indicate "back"
-            elif choice == 'a':
-                selected_files = message_files
-                break
-            elif len(message_files) > PAGE_SIZE and choice == 'n' and (page + 1) * PAGE_SIZE < len(message_files):
-                page += 1
-            elif len(message_files) > PAGE_SIZE and choice == 'p' and page > 0:
-                page -= 1
-            elif choice.isdigit():
-                num = int(choice)
-                if 1 <= num <= len(message_files):
-                    selected_files = [message_files[num - 1]]
+                if choice == 'q':
+                    print("Quitting.")
+                    return False
+                elif choice == 'b':
+                    print("Returning to options menu.")
+                    return None  # Special return value to indicate "back"
+                elif choice == 'a':
+                    selected_files = message_files
                     break
+                elif len(message_files) > PAGE_SIZE and choice == 'n' and (page + 1) * PAGE_SIZE < len(message_files):
+                    page += 1
+                elif len(message_files) > PAGE_SIZE and choice == 'p' and page > 0:
+                    page -= 1
+                elif choice.isdigit():
+                    num = int(choice)
+                    if 1 <= num <= len(message_files):
+                        selected_files = [message_files[num - 1]]
+                        break
+                    else:
+                        print(f"Invalid choice. Please enter a number between 1 and {len(message_files)}, 'a', 'b', 'n', 'p', or 'q'.")
                 else:
                     print(f"Invalid choice. Please enter a number between 1 and {len(message_files)}, 'a', 'b', 'n', 'p', or 'q'.")
-            else:
-                print(f"Invalid choice. Please enter a number between 1 and {len(message_files)}, 'a', 'b', 'n', 'p', or 'q'.")
 
         # Get download directory from config
         config = read_config()
@@ -3248,6 +3264,7 @@ def print_page(dumps, dump_availability, page):
             print("n) Next page")
         if page > 0:
             print("p) Previous page")
+    print("e) Queue Presets")
     print("c) Config Menu")
     print("r) Retry all probably_deleted posts")
     print("q) Quit")
@@ -3510,9 +3527,345 @@ def process_probably_deleted_retry(conn, pacer, safety_config, config, notifier=
     input("Press Enter to continue...")
 
 
+# ---------------------------------------------------------------------------
+# Preset helpers
+# ---------------------------------------------------------------------------
+
+def _load_presets():
+    if not os.path.exists(PRESETS_FILE):
+        return []
+    try:
+        with open(PRESETS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def _save_presets(presets):
+    with open(PRESETS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(presets, f, indent=2)
+
+def _get_dm_threads_for_dump(dump_path):
+    inbox_dir = os.path.join(dump_path, DM_INBOX_PATH)
+    if not os.path.isdir(inbox_dir):
+        return []
+    threads = []
+    for entry in os.listdir(inbox_dir):
+        full = os.path.join(inbox_dir, entry)
+        if os.path.isdir(full) and os.path.exists(os.path.join(full, 'message_1.json')):
+            threads.append(entry)
+    return sorted(threads)
+
+def _print_toggle_list(items, selected_set, title, show_index=True):
+    print(f"\n{title}")
+    for i, item in enumerate(items, 1):
+        mark = 'x' if item in selected_set else ' '
+        prefix = f"{i:2d}. " if show_index else "    "
+        print(f"  [{mark}] {prefix}{item}")
+
+def create_preset(dumps, dump_availability):
+    print("\n" + "=" * 60)
+    print("  CREATE QUEUE PRESET")
+    print("=" * 60)
+    print("  !! NOTE: You are configuring a queue preset.")
+    print("  !! NOTHING WILL BE DOWNLOADED until you run the preset.")
+    print("=" * 60)
+
+    # --- Step 1: pick a dump (or 'latest') ---
+    print("\nWhich dump should this preset target?")
+    print("  0. Always use the latest dump (recommended)")
+    for i, (name, _) in enumerate(dumps, 1):
+        avail = dump_availability.get(name, {})
+        flags = ''.join([c if avail.get(c) else ' ' for c in 'plrsd'])
+        print(f"  {i:2d}. {name:<35} [{flags}]")
+    print("  b) Cancel")
+
+    dump_choice = None
+    while dump_choice is None:
+        raw = input("\nSelect dump (0 for latest, number, or b): ").strip().lower()
+        log_user_input("PRESET_CREATE_DUMP_SELECT", raw)
+        if raw == 'b':
+            return
+        if raw == '0':
+            dump_choice = '__latest__'
+            selected_dump_path = dumps[0][1]  # use latest for DM thread discovery
+            print("  -> Will use latest dump at run time.")
+            break
+        if raw.isdigit():
+            n = int(raw)
+            if 1 <= n <= len(dumps):
+                dump_choice = dumps[n - 1][0]
+                selected_dump_path = dumps[n - 1][1]
+                print(f"  -> Locked to: {dump_choice}")
+                break
+        print(f"  Invalid. Enter 0-{len(dumps)} or b.")
+
+    # Determine what's available in the chosen dump for the task picker
+    if dump_choice == '__latest__':
+        avail = dump_availability.get(dumps[0][0], {})
+    else:
+        avail = dump_availability.get(dump_choice, {})
+
+    # --- Step 2: toggle task types ---
+    TASK_LABELS = []
+    TASK_KEYS   = []
+    if avail.get('l'):
+        TASK_LABELS.append("Liked Posts")
+        TASK_KEYS.append('liked')
+    if avail.get('s'):
+        TASK_LABELS.append("Saved Posts")
+        TASK_KEYS.append('saved')
+    if avail.get('r'):
+        TASK_LABELS.append("Reposts")
+        TASK_KEYS.append('reposts')
+    if avail.get('p'):
+        TASK_LABELS.append("Profile Posts")
+        TASK_KEYS.append('profile')
+    if avail.get('d'):
+        TASK_LABELS.append("DMs (select conversations next)")
+        TASK_KEYS.append('dm')
+
+    if not TASK_LABELS:
+        print("  No downloadable content found in the selected dump.")
+        return
+
+    selected_tasks = set()
+    print("\nToggle tasks on/off. Enter a number to toggle, 'd' when done, 'b' to cancel.")
+    while True:
+        _print_toggle_list(TASK_LABELS, selected_tasks, "Tasks:")
+        raw = input("\n  Number to toggle, 'd' done, 'b' cancel: ").strip().lower()
+        log_user_input("PRESET_CREATE_TASK_TOGGLE", raw)
+        if raw == 'b':
+            return
+        if raw == 'd':
+            if not selected_tasks:
+                print("  Select at least one task.")
+                continue
+            break
+        if raw.isdigit():
+            n = int(raw)
+            if 1 <= n <= len(TASK_LABELS):
+                label = TASK_LABELS[n - 1]
+                if label in selected_tasks:
+                    selected_tasks.discard(label)
+                else:
+                    selected_tasks.add(label)
+                continue
+        print(f"  Invalid. Enter 1-{len(TASK_LABELS)}, 'd', or 'b'.")
+
+    # Determine ordered task list (preserve display order)
+    ordered_tasks = [TASK_KEYS[i] for i, lbl in enumerate(TASK_LABELS) if lbl in selected_tasks]
+
+    # --- Step 3: DM conversation selection ---
+    dm_conversations = []
+    if 'dm' in ordered_tasks:
+        threads = _get_dm_threads_for_dump(selected_dump_path)
+        if not threads:
+            print("  No DM threads found in the selected dump — DM task will be skipped at run time.")
+        else:
+            print("\nToggle DM conversations to include. 'd' when done, 'a' to select all, 'b' to cancel.")
+            dm_selected = set()
+            page = 0
+            while True:
+                start = page * PAGE_SIZE
+                end = start + PAGE_SIZE
+                page_threads = threads[start:end]
+                print(f"\n  DM Conversations (page {page+1}/{(len(threads)-1)//PAGE_SIZE+1}):")
+                for i, t in enumerate(page_threads, start + 1):
+                    mark = 'x' if t in dm_selected else ' '
+                    print(f"    [{mark}] {i:2d}. {t}")
+                if len(threads) > PAGE_SIZE:
+                    if end < len(threads):
+                        print("    n) Next page")
+                    if page > 0:
+                        print("    p) Previous page")
+                print("    a) Select all  |  d) Done  |  b) Cancel")
+                raw = input("\n  Number to toggle, a/d/b/n/p: ").strip().lower()
+                log_user_input("PRESET_CREATE_DM_SELECT", raw)
+                if raw == 'b':
+                    return
+                if raw == 'a':
+                    dm_selected = set(threads)
+                    continue
+                if raw == 'd':
+                    if not dm_selected:
+                        print("  Select at least one conversation or remove DM task.")
+                        continue
+                    break
+                if len(threads) > PAGE_SIZE and raw == 'n' and end < len(threads):
+                    page += 1
+                    continue
+                if len(threads) > PAGE_SIZE and raw == 'p' and page > 0:
+                    page -= 1
+                    continue
+                if raw.isdigit():
+                    n = int(raw)
+                    if 1 <= n <= len(threads):
+                        t = threads[n - 1]
+                        if t in dm_selected:
+                            dm_selected.discard(t)
+                        else:
+                            dm_selected.add(t)
+                        continue
+                print(f"  Invalid input.")
+            dm_conversations = [t for t in threads if t in dm_selected]
+
+    # --- Step 4: name it ---
+    while True:
+        name = input("\nPreset name (or 'b' to cancel): ").strip()
+        log_user_input("PRESET_CREATE_NAME", name)
+        if name.lower() == 'b':
+            return
+        if not name:
+            print("  Name cannot be empty.")
+            continue
+        presets = _load_presets()
+        if any(p['name'] == name for p in presets):
+            overwrite = input(f"  Preset '{name}' already exists. Overwrite? [y/N]: ").strip().lower()
+            log_user_input("PRESET_CREATE_OVERWRITE", overwrite)
+            if overwrite != 'y':
+                continue
+            presets = [p for p in presets if p['name'] != name]
+        break
+
+    # --- Build and save ---
+    tasks = []
+    for key in ordered_tasks:
+        entry = {'type': key}
+        if key == 'dm':
+            entry['conversations'] = dm_conversations
+        tasks.append(entry)
+
+    preset = {
+        'name': name,
+        'dump': dump_choice,
+        'tasks': tasks,
+    }
+    presets.append(preset)
+    _save_presets(presets)
+
+    task_summary = ', '.join(
+        (t['type'] if t['type'] != 'dm' else f"dm({len(t.get('conversations',[]))} convs)")
+        for t in tasks
+    )
+    print(f"\n  Preset '{name}' saved. Tasks: {task_summary}")
+    input("Press Enter to continue...")
+
+
+def run_preset(conn, dumps, dump_availability, pacer, safety_config, config, notifier):
+    presets = _load_presets()
+    if not presets:
+        print("\n  No presets saved yet. Create one first (c).")
+        input("Press Enter to continue...")
+        return
+
+    print("\n=== Run Preset ===")
+    for i, p in enumerate(presets, 1):
+        task_summary = ', '.join(
+            (t['type'] if t['type'] != 'dm' else f"dm({len(t.get('conversations',[]))} convs)")
+            for t in p['tasks']
+        )
+        dump_label = "latest" if p['dump'] == '__latest__' else p['dump']
+        print(f"  {i}. {p['name']}  [{dump_label}]  ->  {task_summary}")
+    print("  b) Back")
+
+    while True:
+        raw = input(f"\nSelect preset (1-{len(presets)}) or b: ").strip().lower()
+        log_user_input("PRESET_RUN_SELECT", raw)
+        if raw == 'b':
+            return
+        if raw.isdigit():
+            n = int(raw)
+            if 1 <= n <= len(presets):
+                preset = presets[n - 1]
+                break
+        print(f"  Invalid. Enter 1-{len(presets)} or b.")
+
+    # Resolve the dump path
+    if preset['dump'] == '__latest__':
+        if not dumps:
+            print("  No profile dumps found.")
+            input("Press Enter to continue...")
+            return
+        dump_name, dump_path = dumps[0]
+    else:
+        match = [(name, path) for name, path in dumps if name == preset['dump']]
+        if not match:
+            print(f"  Dump '{preset['dump']}' not found. Has it been deleted?")
+            input("Press Enter to continue...")
+            return
+        dump_name, dump_path = match[0]
+
+    print(f"\n{'='*60}")
+    print(f"  Running preset: {preset['name']}")
+    print(f"  Dump: {dump_name}")
+    print(f"  Tasks: {len(preset['tasks'])}")
+    print(f"{'='*60}")
+
+    any_ran = False
+    for step_idx, task in enumerate(preset['tasks'], 1):
+        if SHUTDOWN.is_set():
+            print("  [PRESET] Shutdown requested — stopping.")
+            break
+
+        ttype = task['type']
+        print(f"\n  [{step_idx}/{len(preset['tasks'])}] Starting: {ttype.upper()}")
+
+        if ttype == 'liked':
+            result = process_liked_for_dump(conn, dump_path, pacer, safety_config, config, notifier)
+        elif ttype == 'saved':
+            result = process_saved_for_dump(conn, dump_path, pacer, safety_config, config, notifier)
+        elif ttype == 'reposts':
+            result = process_reposts_for_dump(conn, dump_path, pacer, safety_config, config, notifier)
+        elif ttype == 'profile':
+            print("  Profile Posts download not yet implemented — skipping.")
+            result = True
+        elif ttype == 'dm':
+            result = process_dm_download(
+                conn, dump_path, pacer, safety_config, config, notifier,
+                preset_conversations=task.get('conversations', [])
+            )
+        else:
+            print(f"  Unknown task type '{ttype}' — skipping.")
+            result = True
+
+        any_ran = True
+        if result is False or SHUTDOWN.is_set():
+            print(f"  [PRESET] Task '{ttype}' returned quit/shutdown — stopping preset.")
+            break
+        # True or None both mean "completed or gracefully skipped", continue
+
+    if any_ran:
+        print(f"\n{'='*60}")
+        print("  PRESET COMPLETE")
+        print(f"{'='*60}")
+        stats = get_download_stats(conn)
+        print("\nSession Download Statistics:")
+        for key, value in stats.items():
+            print(f"  {key}: {value}")
+    input("\nPress Enter to return to menu...")
+
+
+def presets_menu(conn, dumps, dump_availability, pacer, safety_config, config, notifier):
+    while True:
+        print("\n=== Queue Presets ===")
+        print("  c) Create queue preset")
+        print("  r) Run queue preset")
+        print("  b) Back")
+        raw = input("\nChoice: ").strip().lower()
+        log_user_input("PRESETS_MENU", raw)
+        if raw == 'b':
+            return
+        if raw == 'c':
+            create_preset(dumps, dump_availability)
+        elif raw == 'r':
+            run_preset(conn, dumps, dump_availability, pacer, safety_config, config, notifier)
+        else:
+            print("  Invalid choice.")
+
+
 def main():
     config = read_config()
-    
+
     # Initialize Pushbullet notifier if configured
     notifier = _make_notifier(config)
     
@@ -3579,11 +3932,11 @@ def main():
         while True:
             print_page(dumps, dump_availability, page)
             if len(dumps) > PAGE_SIZE:
-                prompt_msg = "Enter your choice (number, n, p, c, r, q): "
-                invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, 'n', 'p', 'c', 'r', or 'q'."
+                prompt_msg = "Enter your choice (number, n, p, e, c, r, q): "
+                invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, 'n', 'p', 'e', 'c', 'r', or 'q'."
             else:
-                prompt_msg = "Enter your choice (number, c, r, q): "
-                invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, 'c', 'r', or 'q'."
+                prompt_msg = "Enter your choice (number, e, c, r, q): "
+                invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, 'e', 'c', 'r', or 'q'."
             
             choice = input(prompt_msg).strip().lower()
             log_user_input("MAIN_MENU_DUMP_SELECT", choice)
@@ -3700,6 +4053,8 @@ def main():
                     print(invalid_msg)
                     user_resp = input("Press Enter to continue...")
                     log_user_input("PRESS_ENTER_CONTINUE", user_resp)
+            elif choice == 'e':
+                presets_menu(conn, dumps, dump_availability, pacer, safety_config, config, notifier)
             elif len(dumps) > PAGE_SIZE and choice == 'n' and (page + 1) * PAGE_SIZE < len(dumps):
                 page += 1
             elif len(dumps) > PAGE_SIZE and choice == 'p' and page > 0:

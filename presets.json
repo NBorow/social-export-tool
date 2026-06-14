@@ -1,0 +1,25 @@
+[
+  {
+    "name": "TESTOH",
+    "dump": "__latest__",
+    "tasks": [
+      {
+        "type": "liked"
+      },
+      {
+        "type": "saved"
+      },
+      {
+        "type": "reposts"
+      },
+      {
+        "type": "dm",
+        "conversations": [
+          "fofao2_5919753831378092",
+          "nick_1778107746924212",
+          "only5reelsaday_9479135675529700"
+        ]
+      }
+    ]
+  }
+]
