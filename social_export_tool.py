@@ -368,6 +368,13 @@ def build_chrome_options(profile_dir: str, window_size: str = "1280,900") -> Opt
     opts.add_argument("--disable-blink-features=AutomationControlled")
     return opts
 
+def is_headless_environment() -> bool:
+    """Return True if no graphical display is available to open a Chrome window."""
+    import sys
+    if sys.platform in ('darwin', 'win32'):
+        return False
+    return not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'))
+
 # --- Config parsing helpers for manual login ---
 def normalize_profile_dir(raw: str) -> str:
 	script_dir = os.path.dirname(__file__)
@@ -2114,16 +2121,16 @@ def extract_urls_from_current_page(driver, username):
     
     return urls, post_data
 
-def get_profile_post_urls(username):
+def get_profile_post_urls(username, config=None):
     """Get all post URLs from a profile using Selenium"""
     print(f"[PROFILE] Getting post URLs for @{username} using Selenium")
-    
+
     try:
         # Dictionary to store URLs and their captions
         post_data = {}
-        
-        # Get profile directory from config
-        config = read_config()
+
+        if config is None:
+            config = read_config()
         profile_dir, _ = resolve_profile_and_cookie(config)
         
         # Set up Chrome options
@@ -2160,7 +2167,7 @@ def get_profile_post_urls(username):
             # Scroll down to load all posts and collect URLs during scrolling
             previous_height = driver.execute_script("return document.body.scrollHeight")
             scroll_attempts = 0
-            max_scrolls = 20  # Limit to prevent infinite scrolling
+            max_scrolls = int(config.get('PROFILE_SCROLL_CAP', '25'))
             all_urls = set()  # Use set to avoid duplicates
             all_post_data = {}
             
@@ -2262,12 +2269,16 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
     Returns:
         bool: True if any posts were downloaded successfully
     """
+    if is_headless_environment():
+        print(f"[PROFILE] Cannot scrape @{username} in headless mode — no display available.")
+        return False
+
     print(f"[PROFILE] Downloading all posts from @{username}")
     downloaded_map = build_downloaded_map(conn)
 
     try:
         # First, get all post URLs from the profile using Selenium
-        result = get_profile_post_urls(username)
+        result = get_profile_post_urls(username, config=config)
         
         if not result or len(result) != 2:
             print(f"[FAILED] No post URLs found for @{username}")
@@ -3817,8 +3828,20 @@ def run_preset(conn, dumps, dump_availability, pacer, safety_config, config, not
         elif ttype == 'reposts':
             result = process_reposts_for_dump(conn, dump_path, pacer, safety_config, config, notifier)
         elif ttype == 'profile':
-            print("  Profile Posts download not yet implemented — skipping.")
-            result = True
+            if is_headless_environment():
+                print("  Profile Posts: cannot scrape in headless mode — skipping.")
+                result = True
+            else:
+                preset_username = task.get('username', '').strip().lstrip('@')
+                if not preset_username:
+                    preset_username = input("  Profile Posts: enter username to scrape (without @): ").strip().lstrip('@')
+                    log_user_input("PRESET_PROFILE_USERNAME_INPUT", preset_username)
+                if not preset_username:
+                    print("  Profile Posts: no username — skipping.")
+                    result = True
+                else:
+                    download_base_dir = config.get('DOWNLOAD_DIRECTORY', os.path.join(os.path.dirname(__file__), 'downloads'))
+                    result = download_profile_posts(conn, preset_username, download_base_dir, source='profile', pacer=pacer, safety_config=safety_config, config=config)
         elif ttype == 'dm':
             result = process_dm_download(
                 conn, dump_path, pacer, safety_config, config, notifier,
@@ -3988,7 +4011,20 @@ def main():
                                         print_options_menu(avail)
                                         continue
                                 elif "Profile Posts Download" in selected_option:
-                                    print("Profile posts download not yet implemented")
+                                    if is_headless_environment():
+                                        print("Cannot do profile scraping in headless mode — no display available.")
+                                        user_resp = input("Press Enter to return to main menu...")
+                                        log_user_input("PRESS_ENTER_RETURN_MENU", user_resp)
+                                        break
+                                    raw_user = input("Enter Instagram username to scrape (without @): ").strip().lstrip('@')
+                                    log_user_input("PROFILE_USERNAME_INPUT", raw_user)
+                                    if not raw_user:
+                                        print("No username entered.")
+                                        user_resp = input("Press Enter to return to main menu...")
+                                        log_user_input("PRESS_ENTER_RETURN_MENU", user_resp)
+                                        break
+                                    download_base_dir = config.get('DOWNLOAD_DIRECTORY', os.path.join(os.path.dirname(__file__), 'downloads'))
+                                    download_profile_posts(conn, raw_user, download_base_dir, source='profile', pacer=pacer, safety_config=safety_config, config=config)
                                     user_resp = input("Press Enter to return to main menu...")
                                     log_user_input("PRESS_ENTER_RETURN_MENU", user_resp)
                                     break
