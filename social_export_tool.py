@@ -2121,16 +2121,16 @@ def extract_urls_from_current_page(driver, username):
     
     return urls, post_data
 
-def get_profile_post_urls(username):
+def get_profile_post_urls(username, config=None):
     """Get all post URLs from a profile using Selenium"""
     print(f"[PROFILE] Getting post URLs for @{username} using Selenium")
-    
+
     try:
         # Dictionary to store URLs and their captions
         post_data = {}
-        
-        # Get profile directory from config
-        config = read_config()
+
+        if config is None:
+            config = read_config()
         profile_dir, _ = resolve_profile_and_cookie(config)
         
         # Set up Chrome options
@@ -2167,7 +2167,7 @@ def get_profile_post_urls(username):
             # Scroll down to load all posts and collect URLs during scrolling
             previous_height = driver.execute_script("return document.body.scrollHeight")
             scroll_attempts = 0
-            max_scrolls = 20  # Limit to prevent infinite scrolling
+            max_scrolls = int(config.get('PROFILE_SCROLL_CAP', '20'))
             all_urls = set()  # Use set to avoid duplicates
             all_post_data = {}
             
@@ -2269,12 +2269,16 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
     Returns:
         bool: True if any posts were downloaded successfully
     """
+    if is_headless_environment():
+        print(f"[PROFILE] Cannot scrape @{username} in headless mode — no display available.")
+        return False
+
     print(f"[PROFILE] Downloading all posts from @{username}")
     downloaded_map = build_downloaded_map(conn)
 
     try:
         # First, get all post URLs from the profile using Selenium
-        result = get_profile_post_urls(username)
+        result = get_profile_post_urls(username, config=config)
         
         if not result or len(result) != 2:
             print(f"[FAILED] No post URLs found for @{username}")
