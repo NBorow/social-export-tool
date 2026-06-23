@@ -2167,7 +2167,7 @@ def get_profile_post_urls(username, config=None):
             # Scroll down to load all posts and collect URLs during scrolling
             previous_height = driver.execute_script("return document.body.scrollHeight")
             scroll_attempts = 0
-            max_scrolls = int(config.get('PROFILE_SCROLL_CAP', '20'))
+            max_scrolls = int(config.get('PROFILE_SCROLL_CAP', '25'))
             all_urls = set()  # Use set to avoid duplicates
             all_post_data = {}
             
