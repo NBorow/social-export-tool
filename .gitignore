@@ -36,6 +36,9 @@ Thumbs.db
 *.tmp
 *.temp
 
+# Debug artifacts
+profile_debug_*.html
+
 # Downloaded content (if any gets created in the project directory)
 downloads/
 *.mp4

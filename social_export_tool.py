@@ -366,14 +366,41 @@ def build_chrome_options(profile_dir: str, window_size: str = "1280,900") -> Opt
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_argument("--disable-blink-features=AutomationControlled")
+    if sys.platform == 'linux':
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
     return opts
 
 def is_headless_environment() -> bool:
     """Return True if no graphical display is available to open a Chrome window."""
-    import sys
     if sys.platform in ('darwin', 'win32'):
         return False
     return not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'))
+
+def ensure_virtual_display() -> bool:
+    """On headless Linux, start Xvfb and set DISPLAY so Chrome can run non-headless.
+    Returns True if a display is available (or was successfully started)."""
+    if sys.platform != 'linux':
+        return True
+    if os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'):
+        return True
+    try:
+        import subprocess
+        proc = subprocess.Popen(
+            ['Xvfb', ':99', '-screen', '0', '1280x720x24'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.environ['DISPLAY'] = ':99'
+        time.sleep(1)
+        print("[PROFILE] Started virtual display (Xvfb :99)")
+        return True
+    except FileNotFoundError:
+        print("[PROFILE] Xvfb not found — install with: sudo apt install xvfb")
+        return False
+    except Exception as e:
+        print(f"[PROFILE] Could not start Xvfb: {e}")
+        return False
 
 # --- Config parsing helpers for manual login ---
 def normalize_profile_dir(raw: str) -> str:
@@ -656,14 +683,17 @@ def load_cookies_from_netscape(cookie_file):
                 if len(parts) >= 7:
                     domain, domain_specified, path, secure, expiry, name, value = parts[:7]
                     if '.instagram.com' in domain or 'instagram.com' in domain:
-                        cookies.append({
+                        cookie = {
                             'name': name,
                             'value': value,
                             'domain': domain,
                             'path': path,
                             'secure': secure.lower() == 'true',
-                            'expiry': int(expiry) if expiry.isdigit() else None
-                        })
+                        }
+                        exp = int(expiry) if expiry.isdigit() else 0
+                        if exp > 0:
+                            cookie['expiry'] = exp
+                        cookies.append(cookie)
         return cookies
     except Exception:
         return []
@@ -1223,11 +1253,12 @@ def extract_shortcode_from_url(url):
     Returns:
         str: Shortcode or None if not found
     """
-    # Handle various Instagram URL formats
+    # Handle various Instagram URL formats, including username-prefixed paths
+    # e.g. instagram.com/username/reel/CODE or instagram.com/p/CODE
     patterns = [
-        r'instagram\.com/p/([A-Za-z0-9_-]+)',
-        r'instagram\.com/reel/([A-Za-z0-9_-]+)',
-        r'instagram\.com/tv/([A-Za-z0-9_-]+)'
+        r'/p/([A-Za-z0-9_-]+)',
+        r'/reel/([A-Za-z0-9_-]+)',
+        r'/tv/([A-Za-z0-9_-]+)',
     ]
     
     for pattern in patterns:
@@ -1718,7 +1749,7 @@ def refile_post(conn, post: dict, existing_records: list[dict], target_dir: str)
 	return False
 
 
-def download_post(conn, post_data, download_dir, pacer=None, config=None, ignore_probably_deleted: bool = False):
+def download_post(conn, post_data, download_dir, pacer=None, config=None, ignore_probably_deleted: bool = False, ignore_downloaded: bool = False):
 	"""
 	Download a single Instagram post using yt-dlp with fallback to gallery-dl.
 	
@@ -1740,7 +1771,7 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None, ignore
 		return False
 	
 	# Check if already downloaded
-	if is_downloaded(conn, shortcode):
+	if not ignore_downloaded and is_downloaded(conn, shortcode):
 		SESSION_TRACKER.record_download_skip()
 		PROGRESS.on_skip()
 		log_line(f"[SKIPPED] {shortcode} already recorded", snapshot=True)
@@ -2099,7 +2130,8 @@ def extract_urls_from_current_page(driver, username):
     for selector in selectors:
         try:
             post_links = driver.find_elements(By.CSS_SELECTOR, selector)
-            
+            if post_links:
+                print(f"[PROFILE] Selector '{selector}' found {len(post_links)} elements")
             for link in post_links:
                 href = link.get_attribute('href')
                 if href and ('/p/' in href or '/reel/' in href):
@@ -2135,22 +2167,56 @@ def get_profile_post_urls(username, config=None):
         
         # Set up Chrome options
         options = build_chrome_options(profile_dir, "1280,900")
-        
-        # Create driver
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+
+        # Create driver — prefer snap chromedriver on Linux to avoid version mismatch
+        snap_chromedriver = '/snap/chromium/current/usr/lib/chromium-browser/chromedriver'
+        if sys.platform == 'linux' and os.path.exists(snap_chromedriver):
+            driver = webdriver.Chrome(service=Service(snap_chromedriver), options=options)
+        else:
+            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
         
         try:
+            # Load cookies into session so Instagram sees us as logged in
+            _, cookie_file = resolve_profile_and_cookie(config)
+            cookies = load_cookies_from_netscape(cookie_file)
+            if cookies:
+                driver.get("https://www.instagram.com/")
+                WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                for cookie in cookies:
+                    try:
+                        driver.add_cookie(cookie)
+                    except Exception:
+                        pass
+                browser_cookies = driver.get_cookies()
+                session_set = any(c['name'] == 'sessionid' for c in browser_cookies)
+                print(f"[PROFILE] Loaded {len(cookies)} cookies into session (sessionid set: {session_set}, browser has {len(browser_cookies)} cookies)")
+            else:
+                print("[PROFILE] Warning: no cookies loaded — session will be logged out")
+
             # Navigate to profile
             profile_url = f"https://www.instagram.com/{username}/"
             print(f"[PROFILE] Loading profile page: {profile_url}")
-            
+
             driver.get(profile_url)
-            
+
             # Wait for page to load
             WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
-            
+
+            # Log page state to help diagnose login/block issues
+            print(f"[PROFILE] Page title: {driver.title}")
+            print(f"[PROFILE] Current URL: {driver.current_url}")
+            body_text = driver.find_element(By.TAG_NAME, "body").text[:200].replace('\n', ' ')
+            print(f"[PROFILE] Body preview: {body_text}")
+            screenshot_path = os.path.join(os.path.dirname(__file__), f"profile_debug_{username}.png")
+            driver.save_screenshot(screenshot_path)
+            print(f"[PROFILE] Screenshot saved: {screenshot_path}")
+            source_path = os.path.join(os.path.dirname(__file__), f"profile_debug_{username}.html")
+            with open(source_path, 'w', encoding='utf-8') as f:
+                f.write(driver.page_source)
+            print(f"[PROFILE] Page source saved: {source_path}")
+
             # Wait for posts to load - look for the post grid
             try:
                 WebDriverWait(driver, 15).until(
@@ -2167,31 +2233,61 @@ def get_profile_post_urls(username, config=None):
             # Scroll down to load all posts and collect URLs during scrolling
             previous_height = driver.execute_script("return document.body.scrollHeight")
             scroll_attempts = 0
+            no_new_streak = 0  # consecutive scrolls with no new URLs
             max_scrolls = int(config.get('PROFILE_SCROLL_CAP', '25'))
             all_urls = set()  # Use set to avoid duplicates
             all_post_data = {}
-            
+
             while scroll_attempts < max_scrolls:
                 # Collect URLs before scrolling
                 current_urls, current_post_data = extract_urls_from_current_page(driver, username)
                 all_urls.update(current_urls)
                 all_post_data.update(current_post_data)
-                
+                url_count_before = len(all_urls)
+
                 print(f"[PROFILE] After scroll {scroll_attempts}: Found {len(all_urls)} total URLs for @{username}")
-                
-                # Scroll down
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                if wait_with_progress("Scroll pause", 2):
+
+                # Instagram uses overflow:hidden on body — find the real scrollable container
+                scroll_result = driver.execute_script("""
+                    var best = null, bestH = 0;
+                    var all = document.querySelectorAll('*');
+                    for (var i = 0; i < all.length; i++) {
+                        var el = all[i];
+                        if (el.scrollHeight > el.clientHeight + 50) {
+                            var style = window.getComputedStyle(el);
+                            var ov = style.overflowY || style.overflow;
+                            if (ov === 'auto' || ov === 'scroll') {
+                                if (el.scrollHeight > bestH) {
+                                    bestH = el.scrollHeight;
+                                    best = el;
+                                }
+                            }
+                        }
+                    }
+                    if (best) {
+                        best.scrollTop = best.scrollHeight;
+                        return best.tagName + '.' + (best.className || '').split(' ')[0] + ' scrollH=' + best.scrollHeight + ' scrollTop=' + best.scrollTop;
+                    }
+                    return 'no scrollable container found';
+                """)
+                print(f"[PROFILE] Scroll container: {scroll_result}")
+                if wait_with_progress("Scroll pause", 6):
                     return [], {}
-                
-                # Check if new content loaded
-                new_height = driver.execute_script("return document.body.scrollHeight")
-                if new_height == previous_height:
-                    # No new content loaded, we've reached the bottom
-                    print(f"[PROFILE] Reached bottom after {scroll_attempts} scrolls for @{username}")
-                    break
-                
-                previous_height = new_height
+
+                # Check if new posts appeared
+                current_urls2, current_post_data2 = extract_urls_from_current_page(driver, username)
+                all_urls.update(current_urls2)
+                all_post_data.update(current_post_data2)
+
+                if len(all_urls) == url_count_before:
+                    no_new_streak += 1
+                    if no_new_streak >= 3:
+                        print(f"[PROFILE] Reached bottom after {scroll_attempts} scrolls for @{username}")
+                        break
+                    print(f"[PROFILE] No new URLs (streak {no_new_streak}/3), retrying...")
+                else:
+                    no_new_streak = 0
+
                 scroll_attempts += 1
                 print(f"[PROFILE] Scrolled {scroll_attempts}/{max_scrolls} for @{username}")
             
@@ -2269,8 +2365,8 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
     Returns:
         bool: True if any posts were downloaded successfully
     """
-    if is_headless_environment():
-        print(f"[PROFILE] Cannot scrape @{username} in headless mode — no display available.")
+    if not ensure_virtual_display():
+        print(f"[PROFILE] Cannot scrape @{username} — no display available and Xvfb could not be started.")
         return False
 
     print(f"[PROFILE] Downloading all posts from @{username}")
@@ -2293,33 +2389,37 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
         # Only create profile-specific folder if we actually have posts to download
         profile_dir = os.path.join(download_dir, sanitize_filename(username))
         os.makedirs(profile_dir, exist_ok=True)
-        
-        print(f"[PROFILE] Found {len(post_urls)} posts to download for @{username}")
-        
+
+        # Build skip set from files already on disk in this profile folder — ignore DB so
+        # posts downloaded via liked/saved/DM still get downloaded here if not on disk.
+        existing_files = os.listdir(profile_dir)
+
+        print(f"[PROFILE] Found {len(post_urls)} posts to download for @{username} ({len(existing_files)} files already on disk)")
+
         # Download each post individually using our existing download_post method
         successful_downloads = 0
         skipped_count = 0
-        
+
         for i, post_url in enumerate(post_urls, 1):
             if SHUTDOWN.is_set():
                 break
             print(f"[PROFILE] Downloading post {i}/{len(post_urls)}: {post_url}")
-            
+
             # Extract shortcode from URL
             shortcode = extract_shortcode_from_url(post_url)
             if not shortcode:
                 print(f"[FAILED] Could not extract shortcode from {post_url}")
                 continue
-            
-            # Check if already downloaded
-            if shortcode in downloaded_map:
-                log_line(f"[SKIP] {shortcode} already downloaded for @{username}", snapshot=True)
+
+            # Skip only if a file containing this shortcode exists in the profile folder on disk
+            if any(shortcode in fname for fname in existing_files):
+                log_line(f"[SKIP] {shortcode} already on disk in profile folder", snapshot=True)
                 skipped_count += 1
                 continue
-            
+
             # Get caption for this post if available
             post_caption = post_data.get(post_url, "")
-            
+
             # Create post data structure
             post_data_dict = {
                 'shortcode': shortcode,
@@ -2330,12 +2430,12 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                 'dm_thread': thread_name,
                 'append_send_for_this_run': append_send_for_this_run
             }
-            
+
             # Use our existing download method with exception handling
             retry_count = 0
             while True:
                 try:
-                    ok = download_post(conn, post_data_dict, profile_dir, pacer, config)
+                    ok = download_post(conn, post_data_dict, profile_dir, pacer, config, ignore_downloaded=True)
                     if ok is True:
                         successful_downloads += 1
                         downloaded_map[shortcode] = _source_priority(source, None)
@@ -3828,20 +3928,16 @@ def run_preset(conn, dumps, dump_availability, pacer, safety_config, config, not
         elif ttype == 'reposts':
             result = process_reposts_for_dump(conn, dump_path, pacer, safety_config, config, notifier)
         elif ttype == 'profile':
-            if is_headless_environment():
-                print("  Profile Posts: cannot scrape in headless mode — skipping.")
+            preset_username = task.get('username', '').strip().lstrip('@')
+            if not preset_username:
+                preset_username = input("  Profile Posts: enter username to scrape (without @): ").strip().lstrip('@')
+                log_user_input("PRESET_PROFILE_USERNAME_INPUT", preset_username)
+            if not preset_username:
+                print("  Profile Posts: no username — skipping.")
                 result = True
             else:
-                preset_username = task.get('username', '').strip().lstrip('@')
-                if not preset_username:
-                    preset_username = input("  Profile Posts: enter username to scrape (without @): ").strip().lstrip('@')
-                    log_user_input("PRESET_PROFILE_USERNAME_INPUT", preset_username)
-                if not preset_username:
-                    print("  Profile Posts: no username — skipping.")
-                    result = True
-                else:
-                    download_base_dir = config.get('DOWNLOAD_DIRECTORY', os.path.join(os.path.dirname(__file__), 'downloads'))
-                    result = download_profile_posts(conn, preset_username, download_base_dir, source='profile', pacer=pacer, safety_config=safety_config, config=config)
+                download_base_dir = config.get('DOWNLOAD_DIRECTORY', os.path.join(os.path.dirname(__file__), 'downloads'))
+                result = download_profile_posts(conn, preset_username, download_base_dir, source='profile', pacer=pacer, safety_config=safety_config, config=config)
         elif ttype == 'dm':
             result = process_dm_download(
                 conn, dump_path, pacer, safety_config, config, notifier,
@@ -4011,11 +4107,6 @@ def main():
                                         print_options_menu(avail)
                                         continue
                                 elif "Profile Posts Download" in selected_option:
-                                    if is_headless_environment():
-                                        print("Cannot do profile scraping in headless mode — no display available.")
-                                        user_resp = input("Press Enter to return to main menu...")
-                                        log_user_input("PRESS_ENTER_RETURN_MENU", user_resp)
-                                        break
                                     raw_user = input("Enter Instagram username to scrape (without @): ").strip().lstrip('@')
                                     log_user_input("PROFILE_USERNAME_INPUT", raw_user)
                                     if not raw_user:
@@ -4649,9 +4740,9 @@ def enrich_post_from_sidecar(post_data: dict, saved_path: str, *, tool: str, bas
 	if (not post_data.get('url')) and web_url:
 		post_data['url'] = web_url
 	
-	# Always override timestamp_ms for liked posts.
-	# If the sidecar has a timestamp, use it; otherwise set None.
-	if post_data.get('source') == 'liked':
+	# Always override timestamp_ms for sources where the sidecar date is more accurate
+	# than whatever placeholder was set before download.
+	if post_data.get('source') in ('liked', 'profile'):
 		post_data['timestamp_ms'] = ts_ms if ts_ms is not None else None
 	else:
 		# For other sources, only fill if missing
