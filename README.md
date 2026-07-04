@@ -13,7 +13,11 @@ A menu-driven tool for managing Instagram data exports (“profile dumps”) and
 
 ## Requirements
 - **Python 3.8+**
-- **Google Chrome** installed (driver handled automatically by `webdriver-manager`)
+- **Google Chrome** or **Chromium** installed
+  - On Linux servers/VMs: `sudo apt install chromium-browser chromium-chromedriver`
+  - Driver is otherwise handled automatically by `webdriver-manager`
+- **Xvfb** (Linux only, required for profile scraping on headless servers): `sudo apt install xvfb`
+  - The tool starts Xvfb automatically when needed — no manual setup required
 - Python packages:
   ```sh
   pip install requests beautifulsoup4 lxml tqdm pytz dateparser emoji chardet python-dateutil selenium webdriver-manager yt-dlp gallery-dl
@@ -111,7 +115,7 @@ python social_export_tool.py
 - **DM Download**: downloads shared posts in selected conversations. Profile shares can optionally trigger full profile grabs (depending on options shown in-app).
 - **Saved Posts Download**: downloads posts from your saved collections and unsorted saved posts, organized into per-collection folders under `downloads/saved/<CollectionName>/` with unsorted posts going to `downloads/saved/_unsorted/`
 - **Liked Posts Download**: downloads posts you've liked, organized under `downloads/liked/`
-- **Profile Posts Download**: downloads all posts from a specific user's profile (not yet implemented)
+- **Profile Posts Download**: downloads all posts from a specific user's profile by scraping with Selenium. Skips posts already on disk in the profile's folder (ignores the database), so re-running only fetches new posts. Files are named with the actual post publish date when `APPEND_POST_DATE=true`.
 
 ### DM Send Message Classification
 When `ASK_FOR_SEND_MESSAGE_APPEND=true` is set in config.txt, the app can detect and use "send messages" from DM conversations to classify downloaded posts:
