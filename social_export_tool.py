@@ -2130,8 +2130,6 @@ def extract_urls_from_current_page(driver, username):
     for selector in selectors:
         try:
             post_links = driver.find_elements(By.CSS_SELECTOR, selector)
-            if post_links:
-                print(f"[PROFILE] Selector '{selector}' found {len(post_links)} elements")
             for link in post_links:
                 href = link.get_attribute('href')
                 if href and ('/p/' in href or '/reel/' in href):
@@ -2187,9 +2185,7 @@ def get_profile_post_urls(username, config=None):
                         driver.add_cookie(cookie)
                     except Exception:
                         pass
-                browser_cookies = driver.get_cookies()
-                session_set = any(c['name'] == 'sessionid' for c in browser_cookies)
-                print(f"[PROFILE] Loaded {len(cookies)} cookies into session (sessionid set: {session_set}, browser has {len(browser_cookies)} cookies)")
+                print(f"[PROFILE] Loaded {len(cookies)} cookies into session")
             else:
                 print("[PROFILE] Warning: no cookies loaded — session will be logged out")
 
@@ -2203,19 +2199,6 @@ def get_profile_post_urls(username, config=None):
             WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
-
-            # Log page state to help diagnose login/block issues
-            print(f"[PROFILE] Page title: {driver.title}")
-            print(f"[PROFILE] Current URL: {driver.current_url}")
-            body_text = driver.find_element(By.TAG_NAME, "body").text[:200].replace('\n', ' ')
-            print(f"[PROFILE] Body preview: {body_text}")
-            screenshot_path = os.path.join(os.path.dirname(__file__), f"profile_debug_{username}.png")
-            driver.save_screenshot(screenshot_path)
-            print(f"[PROFILE] Screenshot saved: {screenshot_path}")
-            source_path = os.path.join(os.path.dirname(__file__), f"profile_debug_{username}.html")
-            with open(source_path, 'w', encoding='utf-8') as f:
-                f.write(driver.page_source)
-            print(f"[PROFILE] Page source saved: {source_path}")
 
             # Wait for posts to load - look for the post grid
             try:
@@ -2245,10 +2228,10 @@ def get_profile_post_urls(username, config=None):
                 all_post_data.update(current_post_data)
                 url_count_before = len(all_urls)
 
-                print(f"[PROFILE] After scroll {scroll_attempts}: Found {len(all_urls)} total URLs for @{username}")
+                print(f"[PROFILE] Scroll {scroll_attempts}: {len(all_urls)} URLs found")
 
-                # Instagram uses overflow:hidden on body — find the real scrollable container
-                scroll_result = driver.execute_script("""
+                # Instagram uses overflow:hidden on body — find and scroll the real scrollable container
+                driver.execute_script("""
                     var best = null, bestH = 0;
                     var all = document.querySelectorAll('*');
                     for (var i = 0; i < all.length; i++) {
@@ -2264,13 +2247,8 @@ def get_profile_post_urls(username, config=None):
                             }
                         }
                     }
-                    if (best) {
-                        best.scrollTop = best.scrollHeight;
-                        return best.tagName + '.' + (best.className || '').split(' ')[0] + ' scrollH=' + best.scrollHeight + ' scrollTop=' + best.scrollTop;
-                    }
-                    return 'no scrollable container found';
+                    if (best) best.scrollTop = best.scrollHeight;
                 """)
-                print(f"[PROFILE] Scroll container: {scroll_result}")
                 if wait_with_progress("Scroll pause", 6):
                     return [], {}
 
@@ -2282,14 +2260,12 @@ def get_profile_post_urls(username, config=None):
                 if len(all_urls) == url_count_before:
                     no_new_streak += 1
                     if no_new_streak >= 3:
-                        print(f"[PROFILE] Reached bottom after {scroll_attempts} scrolls for @{username}")
+                        print(f"[PROFILE] Reached bottom at {scroll_attempts} scrolls")
                         break
-                    print(f"[PROFILE] No new URLs (streak {no_new_streak}/3), retrying...")
                 else:
                     no_new_streak = 0
 
                 scroll_attempts += 1
-                print(f"[PROFILE] Scrolled {scroll_attempts}/{max_scrolls} for @{username}")
             
             # Final collection after scrolling is done
             final_urls, final_post_data = extract_urls_from_current_page(driver, username)
