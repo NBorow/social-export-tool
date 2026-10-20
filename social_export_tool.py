@@ -13,7 +13,7 @@ import threading
 import signal
 from collections import deque
 from datetime import datetime
-from glob import glob
+from glob import glob, escape as glob_escape
 from urllib.parse import urlparse
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -348,6 +348,16 @@ COOKIE_FILE = os.path.join(os.path.dirname(__file__), 'insta_cookies.txt')
 PRESETS_FILE = os.path.join(os.path.dirname(__file__), 'presets.json')
 PAGE_SIZE = 10
 
+def tool_path(name: str) -> str:
+    """Prefer the yt-dlp/gallery-dl installed next to this Python (the venv), so
+    runs without an activated venv (systemd, cron) don't pick up a stale system copy."""
+    exe_dir = os.path.dirname(sys.executable)
+    for candidate in (name, name + '.exe'):
+        path = os.path.join(exe_dir, candidate)
+        if os.path.isfile(path):
+            return path
+    return name
+
 # --- Centralized Chrome options builder ---
 def build_chrome_options(profile_dir: str, window_size: str = "1280,900") -> Options:
     """
@@ -625,6 +635,201 @@ class SafetyPacer:
                         print(f"[SAFE] Long break: {int(long_break)}s")
                         if wait_with_progress("Long break", long_break):
                             return
+
+# --- Run state, block breaker, run lock ---
+# Small JSON file next to the script that survives restarts/redeploys:
+#   job:            the preset an unattended run is working through (for --resume)
+#   cooldown_until: epoch seconds; no downloads before this (set by the block breaker)
+#   breaker_probation: True after a trip until the next success (trips again faster)
+RUN_STATE_FILE = os.path.join(os.path.dirname(__file__), '.run_state.json')
+RUN_LOCK_FILE = os.path.join(os.path.dirname(__file__), '.run.lock')
+
+# Exit codes for unattended runs (systemd keys off these)
+EXIT_NEEDS_ATTENTION = 3   # checkpoint / login needed: don't auto-restart
+EXIT_LOCK_BUSY = 75        # another process is downloading: retry later
+
+UNATTENDED = False
+
+
+class NeedsAttention(Exception):
+    """Raised in unattended runs when a human has to act (checkpoint, login)."""
+
+
+def ask(prompt: str, unattended_answer: str | None = None) -> str:
+    """
+    input() that is safe for unattended runs. When running unattended, returns
+    unattended_answer instead of blocking, or raises NeedsAttention if there is no
+    safe automatic answer.
+    """
+    if UNATTENDED:
+        if unattended_answer is None:
+            raise NeedsAttention(prompt.strip())
+        print(f"{prompt}{unattended_answer}  [unattended]")
+        return unattended_answer
+    return input(prompt)
+
+
+def load_run_state() -> dict:
+    try:
+        with open(RUN_STATE_FILE, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+        return state if isinstance(state, dict) else {}
+    except Exception:
+        return {}
+
+
+def update_run_state(**changes) -> dict:
+    """Merge changes into the run state file (None deletes a key). Atomic write."""
+    state = load_run_state()
+    for key, value in changes.items():
+        if value is None:
+            state.pop(key, None)
+        else:
+            state[key] = value
+    tmp = RUN_STATE_FILE + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, RUN_STATE_FILE)
+    return state
+
+
+def _skippable_wait(label: str, seconds: float, msg: str) -> bool:
+    """Cancellable wait; Enter skips it when interactive. Returns True on shutdown."""
+    if os.name == 'nt':
+        print(f"{msg} (Press Enter to skip)")
+        return wait_with_progress(label, seconds, win_enter_skip=True)
+    if sys.stdin.isatty():
+        return posix_sleep_with_optional_enter(seconds, msg)
+    print(msg)
+    return wait_with_progress(label, seconds)
+
+
+class BlockBreaker:
+    """
+    Detects silent blocks: Instagram doesn't always answer a block with a 429.
+    Sometimes every request just fails generically, and the run keeps burning
+    through the queue (April 2026: ~1,100 failed requests over 13 hours).
+
+    N failures in a row with no success in between trips the breaker: downloads
+    pause for the cooldown, and the cooldown is persisted so restarts honor it.
+    After a trip, the next trip needs only a few failures until something succeeds.
+    """
+    PROBATION_THRESHOLD = 3
+
+    def __init__(self):
+        self.threshold = 10
+        self.cooldown_hours = 8.0
+        self.streak = 0
+        self.notifier = None
+
+    def configure(self, config: dict, notifier=None):
+        try:
+            self.threshold = int(config.get('BLOCK_BREAKER_THRESHOLD', '10'))
+        except ValueError:
+            self.threshold = 10
+        try:
+            self.cooldown_hours = float(config.get('BLOCK_COOLDOWN_HOURS', '8'))
+        except ValueError:
+            self.cooldown_hours = 8.0
+        self.notifier = notifier
+
+    @property
+    def enabled(self) -> bool:
+        return self.threshold > 0
+
+    def on_success(self):
+        self.streak = 0
+        if load_run_state().get('breaker_probation'):
+            update_run_state(breaker_probation=None)
+
+    def on_failure(self):
+        if not self.enabled:
+            return
+        self.streak += 1
+        limit = self.PROBATION_THRESHOLD if load_run_state().get('breaker_probation') else self.threshold
+        if self.streak >= limit:
+            self._trip()
+
+    def _trip(self):
+        until = time.time() + self.cooldown_hours * 3600
+        update_run_state(cooldown_until=until, breaker_probation=True)
+        until_str = datetime.fromtimestamp(until).strftime('%Y-%m-%d %H:%M')
+        msg = (f"{self.streak} downloads failed in a row with no success: probably a silent block. "
+               f"Pausing downloads until {until_str} ({self.cooldown_hours:g}h).")
+        log_line(f"\n[BREAKER] {msg}", snapshot=True)
+        self.streak = 0
+        if self.notifier is not None:
+            self.notifier("Instagram Export – Probable Block", msg)
+
+    def wait_if_cooling(self) -> bool:
+        """Block until any active cooldown is over. Returns True if shutdown was requested."""
+        until = load_run_state().get('cooldown_until') or 0
+        remaining = until - time.time()
+        if remaining <= 0:
+            return SHUTDOWN.is_set()
+        until_str = datetime.fromtimestamp(until).strftime('%Y-%m-%d %H:%M')
+        if _skippable_wait("Block cooldown", remaining, f"[BREAKER] Cooling down until {until_str}"):
+            return True  # keep cooldown_until so a restart keeps honoring it
+        update_run_state(cooldown_until=None)
+        return SHUTDOWN.is_set()
+
+
+BREAKER = BlockBreaker()
+
+
+class RunLock:
+    """
+    Exclusive lock held by whichever process is downloading, so the background
+    service and an interactive session never hit Instagram at the same time.
+    Browsing menus doesn't need it, only downloading does.
+    """
+    def __init__(self, path: str):
+        self.path = path
+        self._fh = None
+
+    @property
+    def held(self) -> bool:
+        return self._fh is not None
+
+    def acquire(self, label: str) -> bool:
+        if self._fh is not None:
+            return True
+        try:
+            import fcntl
+        except ImportError:
+            return True  # Windows: no lock support, single-user anyway
+        fh = open(self.path, 'a+', encoding='utf-8')
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"pid={os.getpid()} {label} since {datetime.now():%Y-%m-%d %H:%M}\n")
+        fh.flush()
+        self._fh = fh
+        return True
+
+    def holder(self) -> str:
+        try:
+            with open(self.path, 'r', encoding='utf-8') as f:
+                return f.read().strip() or "another process"
+        except Exception:
+            return "another process"
+
+
+RUN_LOCK = RunLock(RUN_LOCK_FILE)
+
+
+def claim_download_lock(label: str) -> bool:
+    """Interactive helper: take the download lock or explain who has it."""
+    if RUN_LOCK.acquire(label):
+        return True
+    print(f"\n[LOCK] Downloads are busy: {RUN_LOCK.holder()}")
+    print("[LOCK] Stop the background job first:  sudo systemctl stop ig-export")
+    return False
+
 
 # Helper to check if a file exists and is non-empty
 def file_exists_nonempty(path):
@@ -1788,6 +1993,10 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None, ignore
 		log_line(f"[PROB_DEL] {shortcode} skipped — marked probably_deleted", snapshot=True)
 		return "skipped"
 
+	# Hold off while the block breaker is cooling down; honor cancel
+	if BREAKER.wait_if_cooling():
+		return False
+
 	# Record download attempt
 	SESSION_TRACKER.record_download_attempt()
 	
@@ -1841,7 +2050,7 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None, ignore
 	# Try yt-dlp first
 	try:
 		cmd = [
-			'yt-dlp',
+			tool_path('yt-dlp'),
 			'--cookies', COOKIE_FILE,
 			'--output', output_path,
 			'--no-check-certificate',
@@ -1855,20 +2064,21 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None, ignore
 		
 		result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 		
-		# Check for rate limit errors
+		# Check for block signals. Only checkpoint/login are unambiguous from yt-dlp:
+		# its Instagram "rate-limit reached or login required" message also shows up for
+		# deleted/private posts that gallery-dl can often still fetch, so rate-limit and
+		# not-found signals fall back to gallery-dl, whose verdict is final.
 		if result.returncode != 0:
 			reason = classify_block_reason(result.stderr)
-			if reason == "rate_limit":
-				raise RateLimitError(result.stderr or "rate limited")
-			elif reason == "checkpoint":
+			if reason == "checkpoint":
 				raise CheckpointError(result.stderr or "checkpoint")
 			elif reason == "login_required":
 				raise LoginRequiredError(result.stderr or "login required")
 			elif reason == "probably_deleted":
 				yt_prob_del_signal = True
 				log_line(f"yt-dlp probably_deleted signal for {shortcode}, trying gallery-dl...", snapshot=False)
-			elif reason == "not_found":
-				raise NotFoundError(result.stderr or "not found/private")
+			elif reason in ("rate_limit", "not_found"):
+				log_line(f"yt-dlp {reason} signal for {shortcode}, trying gallery-dl...", snapshot=False)
 
 		if result.returncode == 0:
 			# Clear probably_deleted state on successful download.
@@ -1905,6 +2115,7 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None, ignore
 			if status == "inserted":
 				fname = os.path.basename(saved_path) if saved_path else f"{shortcode}"
 				SESSION_TRACKER.record_download_success()
+				BREAKER.on_success()
 				PROGRESS.on_success()  # Update progress BEFORE taking snapshot
 				if PROGRESS.active:
 					sticky_line = PROGRESS.render_line()  # Get snapshot with updated counts
@@ -1938,6 +2149,8 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None, ignore
 		else:
 			log_line(f"yt-dlp failed for {shortcode}: {result.stderr}", snapshot=False)
 			
+	except (CheckpointError, LoginRequiredError):
+		raise  # must reach the caller's block handling, not the catch-all below
 	except subprocess.TimeoutExpired:
 		log_line(f"yt-dlp timeout for {shortcode}", snapshot=False)
 	except Exception as e:
@@ -1951,7 +2164,7 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None, ignore
 		gallery_filename = f"{basename}_{{num}}.{{extension}}"
 
 		cmd = [
-			'gallery-dl',
+			tool_path('gallery-dl'),
 			'--cookies', COOKIE_FILE,
 			'--directory', download_dir,
 			'--filename', gallery_filename,
@@ -1975,7 +2188,8 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None, ignore
 			elif reason == "probably_deleted":
 				gallery_prob_del_signal = True
 				log_line(f"gallery-dl probably_deleted signal for {shortcode}", snapshot=False)
-			elif reason == "not_found":
+			elif reason == "not_found" and not yt_prob_del_signal:
+				BREAKER.on_failure()
 				raise NotFoundError(result.stderr or "not found/private")
 
 		if result.returncode == 0:
@@ -2030,6 +2244,7 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None, ignore
 			if status == "inserted":
 				fname = os.path.basename(saved_path) if saved_path else f"{shortcode}"
 				SESSION_TRACKER.record_download_success()
+				BREAKER.on_success()
 				PROGRESS.on_success()  # Update progress BEFORE taking snapshot
 				if PROGRESS.active:
 					sticky_line = PROGRESS.render_line()  # Get snapshot with updated counts
@@ -2059,6 +2274,8 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None, ignore
 		else:
 			log_line(f"gallery-dl failed for {shortcode}: {result.stderr}", snapshot=False)
 			
+	except (RateLimitError, CheckpointError, LoginRequiredError, NotFoundError):
+		raise  # must reach the caller's block handling, not the catch-all below
 	except subprocess.TimeoutExpired:
 		log_line(f"gallery-dl timeout for {shortcode}", snapshot=False)
 	except Exception as e:
@@ -2068,6 +2285,7 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None, ignore
 	if yt_prob_del_signal:
 		status = mark_probably_deleted(conn, post_data, _prob_del_reason)
 		SESSION_TRACKER.record_download_failure()
+		BREAKER.on_failure()
 		SESSION_TRACKER.record_newly_prob_deleted()
 		SESSION_TRACKER.record_error(f"ProbDel: {shortcode} - {_prob_del_reason}")
 		PROGRESS.on_failure()
@@ -2084,6 +2302,7 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None, ignore
 	# Generic failure: both tools failed for other reasons
 	error_msg = f"Both yt-dlp and gallery-dl failed to download {shortcode}"
 	status = record_failure(conn, post_data, error_msg)
+	BREAKER.on_failure()
 	if status == "inserted":
 		log_line(f"[ERROR] {shortcode} → {error_msg}", snapshot=True)
 		SESSION_TRACKER.record_download_failure()
@@ -2441,7 +2660,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                             return False  # Shutdown requested
                         retry_count += 1
                         continue
-                    resp = input("[Enter]=retry now  |  D=delayed exponential retry  |  S=skip this item  |  Q=quit run > ").strip().lower()
+                    resp = ask("[Enter]=retry now  |  D=delayed exponential retry  |  S=skip this item  |  Q=quit run > ", "d").strip().lower()
                     log_user_input("RATE_LIMIT_MENU", resp)
                     if resp == "q":
                         return False
@@ -2450,7 +2669,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                         SESSION_TRACKER.record_download_skip()
                         break
                     if resp == "d":
-                        retry_count = 0  # start delayed retry mode at first step
+                        retry_count = 1  # retry_count > 0 switches to delayed retry mode
                         continue  # loop will sleep next time
                     # default: immediate retry
                     continue
@@ -2458,7 +2677,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                     print(f"\n[BLOCK] Checkpoint/challenge.")
                     print("[Advice] Complete MANUAL LOGIN with the same persistent profile (or wait/switch), then retry.")
                     print("[Advice] After clearing the challenge, waiting ~30–60 minutes before resuming is safest.")
-                    resp = input("[Enter]=retry  |  M=manual login now  |  S=skip  |  Q=quit > ").strip().lower()
+                    resp = ask("[Enter]=retry  |  M=manual login now  |  S=skip  |  Q=quit > ").strip().lower()
                     log_user_input("CHECKPOINT_MENU", resp)
                     if resp == "q":
                         return False
@@ -2477,7 +2696,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                 except LoginRequiredError as e:
                     print(f"\n[BLOCK] Login required (cookies/session invalid).")
                     print("[Advice] Revalidate cookies via MANUAL LOGIN, then retry.")
-                    resp = input("[M]=manual login now  |  R=retry with current cookies  |  S=skip  |  Q=quit > ").strip().lower()
+                    resp = ask("[M]=manual login now  |  R=retry with current cookies  |  S=skip  |  Q=quit > ").strip().lower()
                     log_user_input("LOGIN_REQUIRED_MENU", resp)
                     if resp == "q":
                         return False
@@ -2511,6 +2730,74 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
     except Exception as e:
         print(f"[ERROR] Profile @{username} - {e}")
         return False
+
+def collect_dm_thread_posts(thread_root: str, thread_name: str):
+    """
+    Build the de-duplicated list of shared posts in one DM thread (all message_*.json parts).
+    Returns (posts, send_text_hits).
+    """
+    part_files = sorted(glob(os.path.join(thread_root, "message_*.json")))
+
+    all_msgs = []
+    for pf in part_files:
+        try:
+            with open(pf, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                all_msgs.extend(data.get("messages", []))
+        except Exception as e:
+            print(f"[DM] Skipping {pf}: {e}")
+
+    # Sort by ascending timestamp for reliable <1s pairing across parts
+    all_msgs.sort(key=lambda m: m.get("timestamp_ms", 0))
+
+    seen_shortcodes = set()
+    posts = []
+    send_text_hits = 0
+
+    for i, m in enumerate(all_msgs):
+        share = m.get("share") or {}
+        link = share.get("link")
+        if not link:
+            continue  # no raw-link fallback; only structured shares
+
+        shortcode = _shortcode_from_share_link(link)
+        if not shortcode or shortcode in seen_shortcodes:
+            continue
+        seen_shortcodes.add(shortcode)
+
+        ts = m.get("timestamp_ms")
+        sender = (m.get("sender_name") or "").strip()
+        orig_owner = (share.get("original_content_owner") or "").strip() or None
+
+        # Pair a send message if next is same sender and within <1s
+        send_text = None
+        if i + 1 < len(all_msgs):
+            nxt = all_msgs[i + 1]
+            if (nxt.get("sender_name") or "").strip() == sender:
+                nts = nxt.get("timestamp_ms")
+                if isinstance(ts, int) and isinstance(nts, int) and 0 <= (nts - ts) <= 1000:
+                    if isinstance(nxt.get("content"), str) and nxt["content"].strip():
+                        send_text = nxt["content"].strip()
+                        send_text_hits += 1
+
+        post = {
+            'shortcode': shortcode,
+            'url': link,
+            'description': None,
+            'original_owner': orig_owner,
+            # do not set caption here; sidecar will populate it
+            'source': 'dm',
+            'username': orig_owner,
+            'timestamp_ms': ts,
+            'dm_thread': thread_name,
+        }
+        if send_text:
+            post['send_text'] = send_text
+
+        posts.append(post)
+
+    return posts, send_text_hits
+
 
 def process_dm_download(conn, selected_path, pacer=None, safety_config=None, config=None, notifier=None, preset_conversations=None):
     """
@@ -2558,6 +2845,14 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
                 print("  [PRESET] None of the preset DM threads found in this dump, skipping.")
                 return True
         else:
+            # Per-thread progress (cached post lists + one DB snapshot)
+            try:
+                dm_scopes = get_dump_scopes(selected_path)['dm']
+                dm_snap = load_status_snapshot(conn)
+            except Exception as e:
+                print(f"[PROGRESS] Unavailable: {e}")
+                dm_scopes, dm_snap = {}, None
+
             # Helper function to print a page of DM conversations
             def print_dm_page(message_files, page):
                 start = page * PAGE_SIZE
@@ -2566,7 +2861,10 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
                 print("\nAvailable DM conversations ({} available):".format(len(message_files)))
                 for idx, msg_file in enumerate(page_items, start + 1):
                     thread_name = os.path.basename(os.path.dirname(msg_file))
-                    print(f"{idx}. {thread_name}")
+                    prog = ""
+                    if dm_snap is not None and thread_name in dm_scopes:
+                        prog = format_progress(count_progress(dm_scopes[thread_name], dm_snap))
+                    print(f"{idx}. {thread_name:<40} {prog}".rstrip())
                 if len(message_files) > PAGE_SIZE:
                     if end < len(message_files):
                         print("n) Next page")
@@ -2636,65 +2934,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
 
             # Gather all message parts for this DM thread
             thread_root = os.path.dirname(msg_file)  # msg_file is the selected message_*.json
-            part_files = sorted(glob(os.path.join(thread_root, "message_*.json")))
-
-            all_msgs = []
-            for pf in part_files:
-                try:
-                    with open(pf, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                        all_msgs.extend(data.get("messages", []))
-                except Exception as e:
-                    print(f"[DM] Skipping {pf}: {e}")
-
-            # Sort by ascending timestamp for reliable <1s pairing across parts
-            all_msgs.sort(key=lambda m: m.get("timestamp_ms", 0))
-
-            seen_shortcodes = set()
-            posts = []
-            send_text_hits = 0
-
-            for i, m in enumerate(all_msgs):
-                share = m.get("share") or {}
-                link = share.get("link")
-                if not link:
-                    continue  # no raw-link fallback; only structured shares
-
-                shortcode = _shortcode_from_share_link(link)
-                if not shortcode or shortcode in seen_shortcodes:
-                    continue
-                seen_shortcodes.add(shortcode)
-
-                ts = m.get("timestamp_ms")
-                sender = (m.get("sender_name") or "").strip()
-                orig_owner = (share.get("original_content_owner") or "").strip() or None
-
-                # Pair a send message if next is same sender and within <1s
-                send_text = None
-                if i + 1 < len(all_msgs):
-                    nxt = all_msgs[i + 1]
-                    if (nxt.get("sender_name") or "").strip() == sender:
-                        nts = nxt.get("timestamp_ms")
-                        if isinstance(ts, int) and isinstance(nts, int) and 0 <= (nts - ts) <= 1000:
-                            if isinstance(nxt.get("content"), str) and nxt["content"].strip():
-                                send_text = nxt["content"].strip()
-                                send_text_hits += 1
-
-                post = {
-                    'shortcode': shortcode,
-                    'url': link,
-                    'description': None,
-                    'original_owner': orig_owner,
-                    # do not set caption here; sidecar will populate it
-                    'source': 'dm',
-                    'username': orig_owner,
-                    'timestamp_ms': ts,
-                    'dm_thread': thread_name,
-                }
-                if send_text:
-                    post['send_text'] = send_text
-
-                posts.append(post)
+            posts, send_text_hits = collect_dm_thread_posts(thread_root, thread_name)
 
             if posts:
                 if not progress_started:
@@ -2711,7 +2951,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
             append_send_for_this_run = False
             if ASK_FOR_SEND_MESSAGE_APPEND and send_text_hits > 0:
                 print(f"Detected {send_text_hits} send messages (<1s after shares) in this conversation.")
-                choice = input("Append them to filenames for this run? [y/N]: ").strip().lower()
+                choice = ask("Append them to filenames for this run? [y/N]: ", "n").strip().lower()
                 log_user_input("APPEND_SEND_MESSAGE", choice)
                 append_send_for_this_run = (choice == 'y')
 
@@ -2784,7 +3024,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
                                 "Instagram Export – Attention Required",
                                 f"Manual decision required (rate_limit) for {short}. Attach to tmux and respond."
                             )
-                        resp = input("[Enter]=retry now  |  D=delayed exponential retry  |  S=skip this item  |  Q=quit run > ").strip().lower()
+                        resp = ask("[Enter]=retry now  |  D=delayed exponential retry  |  S=skip this item  |  Q=quit run > ", "d").strip().lower()
                         log_user_input("RATE_LIMIT_MENU", resp)
                         if resp == "q":
                             return False
@@ -2792,7 +3032,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
                             record_failure(conn, post, "Skipped after rate limit")
                             break
                         if resp == "d":
-                            retry_count = 0  # start delayed retry mode at first step
+                            retry_count = 1  # retry_count > 0 switches to delayed retry mode
                             continue  # loop will sleep next time
                         # default: immediate retry
                         continue
@@ -2806,7 +3046,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
                                 "Instagram Export – Attention Required",
                                 f"Manual decision required (checkpoint) for {short}. Attach to tmux and respond."
                             )
-                        resp = input("[Enter]=retry  |  M=manual login now  |  S=skip  |  Q=quit > ").strip().lower()
+                        resp = ask("[Enter]=retry  |  M=manual login now  |  S=skip  |  Q=quit > ").strip().lower()
                         log_user_input("CHECKPOINT_MENU", resp)
                         if resp == "q":
                             return False
@@ -2831,7 +3071,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
                                 "Instagram Export – Attention Required",
                                 f"Manual decision required (login_required) for {short}. Attach to tmux and respond."
                             )
-                        resp = input("[M]=manual login now  |  R=retry with current cookies  |  S=skip  |  Q=quit > ").strip().lower()
+                        resp = ask("[M]=manual login now  |  R=retry with current cookies  |  S=skip  |  Q=quit > ").strip().lower()
                         log_user_input("LOGIN_REQUIRED_MENU", resp)
                         if resp == "q":
                             return False
@@ -2964,7 +3204,7 @@ def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 							"Instagram Export – Attention Required",
 							f"Manual decision required (checkpoint) for {short}. Attach to tmux and respond."
 						)
-					resp = input("[Enter]=retry  |  M=manual login  |  S=skip  |  Q=quit > ").strip().lower()
+					resp = ask("[Enter]=retry  |  M=manual login  |  S=skip  |  Q=quit > ").strip().lower()
 					log_user_input("CHECKPOINT_MENU", resp)
 					if resp == "q": return False
 					if resp == "s":
@@ -2985,7 +3225,7 @@ def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 							"Instagram Export – Attention Required",
 							f"Manual decision required (login_required) for {short}. Attach to tmux and respond."
 						)
-					resp = input("[M]=manual login  |  R=retry  |  S=skip  |  Q=quit > ").strip().lower()
+					resp = ask("[M]=manual login  |  R=retry  |  S=skip  |  Q=quit > ").strip().lower()
 					log_user_input("LOGIN_REQUIRED_MENU", resp)
 					if resp == "q": return False
 					if resp == "s":
@@ -3091,7 +3331,7 @@ def process_reposts_for_dump(conn, dump_path: str, pacer, safety_config: dict, c
 					if notifier is not None:
 						notifier("Instagram Export – Attention Required",
 							f"Manual decision required (checkpoint) for {shortcode}.")
-					resp = input("[Enter]=retry  |  M=manual login  |  S=skip  |  Q=quit > ").strip().lower()
+					resp = ask("[Enter]=retry  |  M=manual login  |  S=skip  |  Q=quit > ").strip().lower()
 					log_user_input("CHECKPOINT_MENU", resp)
 					if resp == "q": return False
 					if resp == "s":
@@ -3103,7 +3343,7 @@ def process_reposts_for_dump(conn, dump_path: str, pacer, safety_config: dict, c
 						manual_login_and_export_cookies(profile_dir, cookie_file)
 				except LoginRequiredError:
 					print("[BLOCK] Login required. Revalidate cookies.")
-					resp = input("[M]=manual login  |  R=retry  |  S=skip  |  Q=quit > ").strip().lower()
+					resp = ask("[M]=manual login  |  R=retry  |  S=skip  |  Q=quit > ").strip().lower()
 					log_user_input("LOGIN_REQUIRED_MENU", resp)
 					if resp == "q": return False
 					if resp == "s":
@@ -3135,15 +3375,11 @@ def process_reposts_for_dump(conn, dump_path: str, pacer, safety_config: dict, c
 		PROGRESS.finish()
 
 
-def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, config: dict, notifier=None):
+def collect_saved_posts(dump_path: str) -> list[dict]:
 	"""
-	Process Saved posts found inside a profile export dump.
-	- Parse saved_posts.json and saved_collections.json
-	- De-dupe by shortcode
-	- Download into per-collection folders under downloads/saved/<CollectionName>
+	Build the de-duplicated saved-posts list for a dump: named collections first
+	(so they win over unsorted), then unsorted saved posts.
 	"""
-	from db import is_downloaded, record_failure  # keep local import style if used elsewhere
-
 	saved_posts_json = os.path.join(dump_path, SAVED_POSTS_PATH)
 	saved_cols_json  = os.path.join(dump_path, SAVED_COLLECTIONS_PATH)
 
@@ -3175,6 +3411,19 @@ def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 		if sc and sc not in seen:
 			seen.add(sc)
 			all_posts.append(p)
+	return all_posts
+
+
+def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, config: dict, notifier=None):
+	"""
+	Process Saved posts found inside a profile export dump.
+	- Parse saved_posts.json and saved_collections.json
+	- De-dupe by shortcode
+	- Download into per-collection folders under downloads/saved/<CollectionName>
+	"""
+	from db import is_downloaded, record_failure  # keep local import style if used elsewhere
+
+	all_posts = collect_saved_posts(dump_path)
 
 	if not all_posts:
 		print("No saved posts found.")
@@ -3241,7 +3490,7 @@ def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 							"Instagram Export – Attention Required",
 							f"Manual decision required (checkpoint) for {short}. Attach to tmux and respond."
 						)
-					resp = input("[Enter]=retry  |  M=manual login  |  S=skip  |  Q=quit > ").strip().lower()
+					resp = ask("[Enter]=retry  |  M=manual login  |  S=skip  |  Q=quit > ").strip().lower()
 					log_user_input("CHECKPOINT_MENU", resp)
 					if resp == "q": return False
 					if resp == "s":
@@ -3262,7 +3511,7 @@ def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 							"Instagram Export – Attention Required",
 							f"Manual decision required (login_required) for {short}. Attach to tmux and respond."
 						)
-					resp = input("[M]=manual login  |  R=retry  |  S=skip  |  Q=quit > ").strip().lower()
+					resp = ask("[M]=manual login  |  R=retry  |  S=skip  |  Q=quit > ").strip().lower()
 					log_user_input("LOGIN_REQUIRED_MENU", resp)
 					if resp == "q": return False
 					if resp == "s":
@@ -3336,7 +3585,235 @@ def get_profile_dumps():
     entries.sort(key=lambda x: x[2], reverse=True)
     return [(name, path) for name, path, _ in entries]
 
-def print_page(dumps, dump_availability, page):
+# --- Progress overview (shown in menus) ---
+# Each dump's post lists (shortcodes per liked/saved/reposts/DM thread) are cached on
+# disk keyed by the source files' mtime+size, so big DM inboxes are parsed once.
+# Done/dead/failed status comes from a fresh DB snapshot on every render.
+PROGRESS_CACHE_FILE = os.path.join(os.path.dirname(__file__), '.progress_cache.json')
+_SCOPE_MEMO: dict = {}
+
+def _files_sig(paths) -> list:
+    sig = []
+    for p in sorted(paths):
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        sig.append([os.path.basename(p), st.st_mtime_ns, st.st_size])
+    return sig
+
+def _unique_codes(posts) -> list:
+    seen = set()
+    out = []
+    for p in posts:
+        sc = p.get('shortcode')
+        if sc and sc not in seen:
+            seen.add(sc)
+            out.append(sc)
+    return out
+
+def get_dump_scopes(dump_path: str) -> dict:
+    """
+    Shortcodes per download scope for a dump:
+      {'liked': [...], 'saved': [...], 'reposts': [...], 'dm': {thread_name: [...]}}
+    """
+    if dump_path in _SCOPE_MEMO:
+        return _SCOPE_MEMO[dump_path]
+
+    try:
+        with open(PROGRESS_CACHE_FILE, 'r', encoding='utf-8') as f:
+            disk = json.load(f)
+    except Exception:
+        disk = {}
+    cached = disk.get(dump_path, {})
+    fresh = {}
+    announced = False
+
+    def scope(key, files, build):
+        nonlocal announced
+        sig = _files_sig(files)
+        old = cached.get(key)
+        if old and old.get('sig') == sig:
+            codes = old.get('codes', [])
+        else:
+            if sig and not announced:
+                print(f"[PROGRESS] Indexing {os.path.basename(dump_path)} (only when the dump changes)...")
+                announced = True
+            codes = build() if sig else []
+        fresh[key] = {'sig': sig, 'codes': codes}
+        return codes
+
+    liked_json = os.path.join(dump_path, LIKED_PATH)
+    reposts_json = os.path.join(dump_path, REPOSTS_PATH)
+    saved_files = [os.path.join(dump_path, SAVED_POSTS_PATH), os.path.join(dump_path, SAVED_COLLECTIONS_PATH), reposts_json]
+    scopes = {
+        'liked': scope('liked', [liked_json], lambda: _unique_codes(parse_liked_posts_json(liked_json))),
+        'saved': scope('saved', saved_files, lambda: _unique_codes(collect_saved_posts(dump_path))),
+        'reposts': scope('reposts', [reposts_json], lambda: _unique_codes(parse_reposts_json(reposts_json))),
+        'dm': {},
+    }
+    inbox_dir = os.path.join(dump_path, DM_INBOX_PATH)
+    for thread in _get_dm_threads_for_dump(dump_path):
+        root = os.path.join(inbox_dir, thread)
+        parts = glob(os.path.join(root, "message_*.json"))
+        scopes['dm'][thread] = scope(
+            f"dm/{thread}", parts,
+            lambda root=root, thread=thread: _unique_codes(collect_dm_thread_posts(root, thread)[0])
+        )
+
+    if fresh != cached:
+        disk[dump_path] = fresh
+        try:
+            tmp = PROGRESS_CACHE_FILE + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(disk, f)
+            os.replace(tmp, PROGRESS_CACHE_FILE)
+        except Exception:
+            pass  # cache is an optimization only
+
+    _SCOPE_MEMO[dump_path] = scopes
+    return scopes
+
+def all_dump_codes(scopes: dict) -> list:
+    codes = list(scopes['liked']) + list(scopes['saved']) + list(scopes['reposts'])
+    for thread_codes in scopes['dm'].values():
+        codes.extend(thread_codes)
+    return list(dict.fromkeys(codes))
+
+def load_status_snapshot(conn) -> dict:
+    """One pass over the DB: downloaded (any source), probably-deleted, failed."""
+    done = build_downloaded_map(conn)
+    dead, failed = set(), set()
+    for sc, prob_del in conn.execute(
+        "SELECT shortcode, COALESCE(is_probably_deleted, 0) FROM posts WHERE status != 'success'"
+    ):
+        (dead if prob_del else failed).add(sc)
+    return {'done': done, 'dead': dead, 'failed': failed}
+
+def count_progress(codes, snap: dict) -> dict:
+    done = dead = failed = 0
+    for sc in codes:
+        if sc in snap['done']:
+            done += 1
+        elif sc in snap['dead']:
+            dead += 1
+        elif sc in snap['failed']:
+            failed += 1
+    total = len(codes)
+    return {'total': total, 'done': done, 'dead': dead, 'failed': failed, 'left': total - done - dead}
+
+def format_progress(c: dict | None) -> str:
+    """'2,341/2,400  97%  · 47 left (40 failed before) · 12 dead'. Percent excludes dead posts."""
+    if not c or not c['total']:
+        return ""
+    obtainable = c['total'] - c['dead']
+    pct = 100 if obtainable <= 0 else c['done'] * 100 // obtainable
+    text = f"{c['done']:,}/{c['total']:,} {pct:3d}%"
+    if c['left'] == 0:
+        return text + " ✓" + (f"  · {c['dead']:,} dead" if c['dead'] else "")
+    extras = [f"{c['left']:,} left" + (f" ({c['failed']:,} failed before)" if c['failed'] else "")]
+    if c['dead']:
+        extras.append(f"{c['dead']:,} dead")
+    return text + "  · " + " · ".join(extras)
+
+def dump_progress_lines(conn, dumps) -> dict:
+    """{dump_name: formatted overall progress} for the main menu."""
+    snap = load_status_snapshot(conn)
+    out = {}
+    for name, path in dumps:
+        try:
+            out[name] = format_progress(count_progress(all_dump_codes(get_dump_scopes(path)), snap))
+        except Exception as e:
+            out[name] = f"(progress unavailable: {e})"
+    return out
+
+def option_progress_lines(conn, dump_path: str) -> dict:
+    """{options-menu label: formatted progress} for one dump."""
+    snap = load_status_snapshot(conn)
+    scopes = get_dump_scopes(dump_path)
+    dm_codes = list(dict.fromkeys(sc for codes in scopes['dm'].values() for sc in codes))
+    return {
+        "Liked Posts Download": format_progress(count_progress(scopes['liked'], snap)),
+        "Reposts Download": format_progress(count_progress(scopes['reposts'], snap)),
+        "Saved Posts Download": format_progress(count_progress(scopes['saved'], snap)),
+        "DM Download": format_progress(count_progress(dm_codes, snap)),
+    }
+
+def _find_moved_file(base_dir: str, recorded_path: str, shortcode: str) -> str | None:
+    """
+    Look for a download under base_dir when its recorded path doesn't exist, e.g. the
+    library was copied from another machine (C:\\...\\dms\\thread\\file) or renamed.
+    Tries the recorded path's trailing folders re-rooted under base_dir, matching any
+    file in that folder containing the shortcode.
+    """
+    parts = [p for p in re.split(r'[\\/]+', recorded_path) if p]
+    for k in range(2, min(5, len(parts)) + 1):
+        folder = os.path.join(base_dir, *parts[-k:-1])
+        if os.path.isdir(folder):
+            hits = glob(os.path.join(folder, f"*{glob_escape(shortcode)}*"))
+            if hits:
+                return sorted(hits)[0]
+    return None
+
+def verify_files_on_disk(conn, dump_name: str, dump_path: str, config: dict):
+    """Check every downloaded post of this dump still exists on disk; offer fixes."""
+    codes = set(all_dump_codes(get_dump_scopes(dump_path)))
+    base_dir = config.get('DOWNLOAD_DIRECTORY', os.path.join(os.path.dirname(__file__), 'downloads'))
+    print(f"\n[VERIFY] Checking files for {dump_name} under {base_dir} ...")
+
+    ok = no_path = 0
+    moved = []    # (row_id, new_path)
+    missing = []  # (row_id, shortcode, source, recorded_path)
+    rows = conn.execute("SELECT id, shortcode, source, local_path FROM posts WHERE status = 'success'").fetchall()
+    for row_id, sc, source, local_path in rows:
+        if sc not in codes:
+            continue
+        if not local_path:
+            no_path += 1
+            continue
+        if os.path.isfile(local_path):
+            ok += 1
+            continue
+        found = _find_moved_file(base_dir, local_path, sc)
+        if found:
+            moved.append((row_id, found))
+        else:
+            missing.append((row_id, sc, source, local_path))
+
+    print(f"[VERIFY] On disk at recorded path: {ok:,}")
+    print(f"[VERIFY] Found elsewhere under the download folder (stored path outdated): {len(moved):,}")
+    print(f"[VERIFY] Missing from disk: {len(missing):,}")
+    if no_path:
+        print(f"[VERIFY] No path recorded (can't check): {no_path:,}")
+
+    if missing:
+        report = os.path.join(RUN_LOG_DIR or os.getcwd(), f"missing-files-{datetime.now():%Y%m%d-%H%M%S}.txt")
+        with open(report, 'w', encoding='utf-8') as f:
+            for _id, sc, source, path in missing:
+                f.write(f"{sc}\t{source}\t{path}\n")
+        print(f"[VERIFY] Missing list written to: {report}")
+
+    if moved:
+        resp = input(f"Update the stored path for {len(moved):,} moved file(s)? [y/N]: ").strip().lower()
+        log_user_input("VERIFY_UPDATE_PATHS", resp)
+        if resp == 'y':
+            conn.executemany("UPDATE posts SET local_path = ? WHERE id = ?", [(p, i) for i, p in moved])
+            conn.commit()
+            print("[VERIFY] Paths updated.")
+    if missing:
+        resp = input(f"Mark {len(missing):,} missing post(s) to re-download on the next run? [y/N]: ").strip().lower()
+        log_user_input("VERIFY_RESET_MISSING", resp)
+        if resp == 'y':
+            conn.executemany(
+                "UPDATE posts SET status = 'failed', error_message = 'File missing on disk (verify)' WHERE id = ?",
+                [(m[0],) for m in missing]
+            )
+            conn.commit()
+            print("[VERIFY] Marked. They'll download into their normal folders next run.")
+    input("Press Enter to continue...")
+
+
+def print_page(dumps, dump_availability, page, progress=None):
     start = page * PAGE_SIZE
     end = start + PAGE_SIZE
     page_items = dumps[start:end]
@@ -3345,7 +3822,8 @@ def print_page(dumps, dump_availability, page):
     for idx, (name, _) in enumerate(page_items, start + 1):
         avail = dump_availability.get(name, {'p': False, 'l': False, 'r': False, 's': False, 'd': False})
         flags = ''.join([c if avail.get(c) else ' ' for c in 'plrsd'])
-        print(f"{idx:2d}. {name:<35} [{flags}]")
+        prog = (progress or {}).get(name, "")
+        print(f"{idx:2d}. {name:<35} [{flags}]  {prog}".rstrip())
     if len(dumps) > PAGE_SIZE:
         if end < len(dumps):
             print("n) Next page")
@@ -3356,7 +3834,7 @@ def print_page(dumps, dump_availability, page):
     print("r) Retry all probably_deleted posts")
     print("q) Quit")
 
-def print_options_menu(avail):
+def print_options_menu(avail, progress=None):
     options = []
     if avail['p']:
         options.append("Profile Posts Download")
@@ -3370,7 +3848,10 @@ def print_options_menu(avail):
         options.append("DM Download")
     print("\nAvailable download options:")
     for i, opt in enumerate(options, 1):
-        print(f"{i}. {opt}")
+        prog = (progress or {}).get(opt, "")
+        print(f"{i}. {opt:<24} {prog}".rstrip())
+    if progress is not None:
+        print("v) Verify downloaded files are on disk")
     print("b) Back to main menu")
     print("q) Quit")
     return options
@@ -3578,7 +4059,7 @@ def process_probably_deleted_retry(conn, pacer, safety_config, config, notifier=
 
                 except LoginRequiredError:
                     print("[BLOCK] Login required during prob_del retry.")
-                    resp = input("[M]=manual login  |  S=skip  |  Q=quit > ").strip().lower()
+                    resp = ask("[M]=manual login  |  S=skip  |  Q=quit > ").strip().lower()
                     log_user_input("PROB_DEL_LOGIN_MENU", resp)
                     if resp == "q":
                         return
@@ -3867,19 +4348,37 @@ def run_preset(conn, dumps, dump_availability, pacer, safety_config, config, not
                 break
         print(f"  Invalid. Enter 1-{len(presets)} or b.")
 
+    if not claim_download_lock(f"preset '{preset['name']}' (interactive)"):
+        input("Press Enter to continue...")
+        return
+    execute_preset(conn, preset, dumps, pacer, safety_config, config, notifier)
+    input("\nPress Enter to return to menu...")
+
+
+def find_preset(name: str) -> dict | None:
+    for p in _load_presets():
+        if p.get('name') == name:
+            return p
+    return None
+
+
+def execute_preset(conn, preset, dumps, pacer, safety_config, config, notifier) -> bool:
+    """
+    Run every task in a preset. Returns True only if all tasks ran to completion
+    (not cancelled, not quit). Re-running a preset is cheap: anything already
+    downloaded is skipped without touching Instagram.
+    """
     # Resolve the dump path
     if preset['dump'] == '__latest__':
         if not dumps:
             print("  No profile dumps found.")
-            input("Press Enter to continue...")
-            return
+            return False
         dump_name, dump_path = dumps[0]
     else:
         match = [(name, path) for name, path in dumps if name == preset['dump']]
         if not match:
             print(f"  Dump '{preset['dump']}' not found. Has it been deleted?")
-            input("Press Enter to continue...")
-            return
+            return False
         dump_name, dump_path = match[0]
 
     print(f"\n{'='*60}")
@@ -3889,9 +4388,11 @@ def run_preset(conn, dumps, dump_availability, pacer, safety_config, config, not
     print(f"{'='*60}")
 
     any_ran = False
+    completed = True
     for step_idx, task in enumerate(preset['tasks'], 1):
         if SHUTDOWN.is_set():
             print("  [PRESET] Shutdown requested — stopping.")
+            completed = False
             break
 
         ttype = task['type']
@@ -3906,7 +4407,7 @@ def run_preset(conn, dumps, dump_availability, pacer, safety_config, config, not
         elif ttype == 'profile':
             preset_username = task.get('username', '').strip().lstrip('@')
             if not preset_username:
-                preset_username = input("  Profile Posts: enter username to scrape (without @): ").strip().lstrip('@')
+                preset_username = ask("  Profile Posts: enter username to scrape (without @): ", "").strip().lstrip('@')
                 log_user_input("PRESET_PROFILE_USERNAME_INPUT", preset_username)
             if not preset_username:
                 print("  Profile Posts: no username — skipping.")
@@ -3926,18 +4427,19 @@ def run_preset(conn, dumps, dump_availability, pacer, safety_config, config, not
         any_ran = True
         if result is False or SHUTDOWN.is_set():
             print(f"  [PRESET] Task '{ttype}' returned quit/shutdown — stopping preset.")
+            completed = False
             break
         # True or None both mean "completed or gracefully skipped", continue
 
     if any_ran:
         print(f"\n{'='*60}")
-        print("  PRESET COMPLETE")
+        print("  PRESET COMPLETE" if completed else "  PRESET STOPPED (run it again to pick up where it left off)")
         print(f"{'='*60}")
         stats = get_download_stats(conn)
         print("\nSession Download Statistics:")
         for key, value in stats.items():
             print(f"  {key}: {value}")
-    input("\nPress Enter to return to menu...")
+    return completed
 
 
 def presets_menu(conn, dumps, dump_availability, pacer, safety_config, config, notifier):
@@ -3958,11 +4460,158 @@ def presets_menu(conn, dumps, dump_availability, pacer, safety_config, config, n
             print("  Invalid choice.")
 
 
+# 'needs_attention' resumes too: after fixing cookies, `systemctl restart ig-export` continues the job
+RESUMABLE_JOB_STATUSES = ('running', 'needs_attention')
+
+
+def run_unattended(conn, preset_name: str, config: dict, notifier) -> int:
+    """
+    Run a preset with no prompts (systemd service, --preset). Returns an exit code.
+    The job is remembered in the run state so --resume picks it back up after a
+    restart or redeploy; posts already downloaded are skipped without network calls.
+    """
+    def set_job(status, note=None):
+        job = load_run_state().get('job') or {}
+        now = datetime.now().isoformat(timespec='seconds')
+        if job.get('preset') != preset_name:
+            job = {'preset': preset_name, 'started_at': now}
+        job.update(status=status, updated_at=now)
+        if note:
+            job['note'] = note
+        else:
+            job.pop('note', None)
+        update_run_state(job=job)
+
+    def needs_attention(reason):
+        print(f"\n[UNATTENDED] Needs attention: {reason}")
+        set_job('needs_attention', reason)
+        notifier("Instagram Export – Attention Required",
+                 f"Job '{preset_name}' paused: {reason}\nFix it, then: sudo systemctl restart ig-export")
+        return EXIT_NEEDS_ATTENTION
+
+    preset = find_preset(preset_name)
+    if preset is None:
+        print(f"[UNATTENDED] No preset named '{preset_name}' in {PRESETS_FILE}")
+        return EXIT_NEEDS_ATTENTION
+
+    if not RUN_LOCK.acquire(f"unattended preset '{preset_name}'"):
+        print(f"[UNATTENDED] Downloads are busy: {RUN_LOCK.holder()}. Will retry later.")
+        return EXIT_LOCK_BUSY
+
+    set_job('running')
+    print(f"[UNATTENDED] Running preset '{preset_name}'")
+
+    if not are_cookies_valid(COOKIE_FILE):
+        return needs_attention("Instagram cookies are invalid or expired. Log in via the interactive menu")
+
+    safety_config = dict(get_safety_config())
+    safety_config['AUTO_RETRY_ON_RATE_LIMIT'] = 'true'  # nobody is there to answer the prompt
+    pacer = SafetyPacer(safety_config, get_recent_download_timestamps(conn, time.time() - 86400))
+
+    try:
+        completed = execute_preset(conn, preset, get_profile_dumps(), pacer, safety_config, config, notifier)
+    except NeedsAttention as e:
+        # Raised from inside a block handler, so the block itself is the exception context
+        cause = e.__context__
+        if isinstance(cause, CheckpointError):
+            return needs_attention("Instagram checkpoint ('verify it's you'). Clear it in the browser, wait 30-60 min")
+        if isinstance(cause, LoginRequiredError):
+            return needs_attention("Instagram says login required (cookies expired). Log in via the interactive menu")
+        return needs_attention(f"a prompt needs an answer: {e}")
+
+    if completed:
+        set_job('done')
+        notifier("Instagram Export – Job Done",
+                 f"Preset '{preset_name}' finished. OK: {SESSION_TRACKER.downloads_successful}, "
+                 f"Failed: {SESSION_TRACKER.downloads_failed}, Skipped: {SESSION_TRACKER.downloads_skipped}")
+        return 0
+    if SHUTDOWN.is_set():
+        set_job('running', "stopped mid-run; resumes on next start")
+        print("[UNATTENDED] Stopped. The job resumes on next start.")
+        return 0
+    return needs_attention("preset stopped early (see the run log)")
+
+
+def parse_args(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Instagram export downloader. With no options, opens the interactive menu."
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--preset', metavar='NAME',
+                       help="run a saved queue preset unattended (no prompts) and remember it as the current job")
+    group.add_argument('--queue', metavar='NAME',
+                       help="make a preset the current job without running it (then: sudo systemctl start ig-export)")
+    group.add_argument('--resume', action='store_true',
+                       help="continue the current job if one is unfinished, else exit (used by the systemd service)")
+    group.add_argument('--status', action='store_true',
+                       help="show the current job, block cooldown, lock holder, and deployed version")
+    group.add_argument('--stop-job', action='store_true',
+                       help="forget the current job so the service stops resuming it")
+    return parser.parse_args(argv)
+
+
+def print_status():
+    state = load_run_state()
+    job = state.get('job')
+    print("Job:      " + (f"{job.get('preset')}  [{job.get('status')}]  started {job.get('started_at')}, updated {job.get('updated_at')}"
+                          + (f"\n          note: {job['note']}" if job.get('note') else "")
+                          if job else "none"))
+    until = state.get('cooldown_until') or 0
+    if until > time.time():
+        print(f"Cooldown: block breaker pause until {datetime.fromtimestamp(until):%Y-%m-%d %H:%M}")
+    else:
+        print("Cooldown: none")
+    probe = RunLock(RUN_LOCK_FILE)
+    if probe.acquire("status probe"):
+        print("Lock:     free (nothing downloading)")
+    else:
+        print(f"Lock:     held by {probe.holder()}")
+    rev_file = os.path.join(os.path.dirname(__file__), '.deployed_rev')
+    if os.path.exists(rev_file):
+        with open(rev_file, 'r', encoding='utf-8') as f:
+            print(f"Deployed: {f.read().strip()}")
+
+
 def main():
+    global UNATTENDED
+    args = parse_args()
+
+    if args.status:
+        print_status()
+        return
+    if args.stop_job:
+        job = load_run_state().get('job')
+        if job:
+            update_run_state(job=dict(job, status='cancelled', updated_at=datetime.now().isoformat(timespec='seconds')))
+            print(f"Job '{job.get('preset')}' cancelled. The service won't resume it.")
+        else:
+            print("No current job.")
+        return
+
+    if args.queue:
+        if find_preset(args.queue) is None:
+            print(f"No preset named '{args.queue}' in {PRESETS_FILE}")
+            raise SystemExit(1)
+        now = datetime.now().isoformat(timespec='seconds')
+        update_run_state(job={'preset': args.queue, 'status': 'running', 'started_at': now, 'updated_at': now})
+        print(f"Queued '{args.queue}'. Start it with: sudo systemctl start ig-export")
+        return
+
+    preset_name = args.preset
+    if args.resume:
+        job = load_run_state().get('job') or {}
+        if job.get('status') not in RESUMABLE_JOB_STATUSES:
+            print(f"[RESUME] Nothing to resume (job: {job.get('preset', 'none')}, status: {job.get('status', 'n/a')}).")
+            return
+        preset_name = job['preset']
+    UNATTENDED = preset_name is not None
+
     config = read_config()
 
     # Initialize Pushbullet notifier if configured
     notifier = _make_notifier(config)
+    BREAKER.configure(config, notifier)
     
     # Install signal handlers early
     install_signal_handlers()
@@ -4003,6 +4652,12 @@ def main():
     conn = init_db(db_path)
     
     try:
+        if UNATTENDED:
+            code = run_unattended(conn, preset_name, config, notifier)
+            if code:
+                raise SystemExit(code)
+            return
+
         # --- New cookie gate with manual/automated login flow ---
         if not ensure_valid_cookies(config):
             print("[FATAL] Could not obtain valid cookies.")
@@ -4025,7 +4680,12 @@ def main():
         
         page = 0
         while True:
-            print_page(dumps, dump_availability, page)
+            try:
+                dump_progress = dump_progress_lines(conn, dumps)
+            except Exception as e:
+                print(f"[PROGRESS] Unavailable: {e}")
+                dump_progress = None
+            print_page(dumps, dump_availability, page, dump_progress)
             if len(dumps) > PAGE_SIZE:
                 prompt_msg = "Enter your choice (number, n, p, e, c, r, q): "
                 invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, 'n', 'p', 'e', 'c', 'r', or 'q'."
@@ -4041,7 +4701,16 @@ def main():
                     selected = dumps[num - 1]
                     selected_name, selected_path = selected
                     avail = dump_availability[selected_name]
-                    options = print_options_menu(avail)
+
+                    def show_options():
+                        try:
+                            progress = option_progress_lines(conn, selected_path)
+                        except Exception as e:
+                            print(f"[PROGRESS] Unavailable: {e}")
+                            progress = None
+                        return print_options_menu(avail, progress)
+
+                    options = show_options()
                     
                     if not options:
                         print("No download options available for this profile dump.")
@@ -4057,11 +4726,18 @@ def main():
                             return
                         elif opt_choice == 'b':
                             break
+                        elif opt_choice == 'v':
+                            verify_files_on_disk(conn, selected_name, selected_path, config)
+                            show_options()
+                            continue
                         elif opt_choice.isdigit():
                             opt_num = int(opt_choice)
                             if 1 <= opt_num <= len(options):
                                 selected_option = options[opt_num-1]
                                 print(f"You selected: {selected_option}")
+                                if not claim_download_lock("interactive menu"):
+                                    show_options()
+                                    continue
                                 
                                 # Handle different download options
                                 if "DM Download" in selected_option:
@@ -4080,7 +4756,7 @@ def main():
                                         return
                                     elif result is None:
                                         # User chose back, re-display options menu
-                                        print_options_menu(avail)
+                                        show_options()
                                         continue
                                 elif "Profile Posts Download" in selected_option:
                                     raw_user = input("Enter Instagram username to scrape (without @): ").strip().lstrip('@')
@@ -4169,7 +4845,8 @@ def main():
                 recent_timestamps = get_recent_download_timestamps(conn, time.time() - 86400)
                 pacer = SafetyPacer(safety_config, recent_timestamps)
             elif choice == 'r':
-                process_probably_deleted_retry(conn, pacer, safety_config, config, notifier)
+                if claim_download_lock("probably_deleted retry"):
+                    process_probably_deleted_retry(conn, pacer, safety_config, config, notifier)
             elif choice == 'q':
                 print("Quitting.")
                 break
@@ -4574,16 +5251,20 @@ def _install_run_logger(log_dir: str) -> str:
     class _Tee:
         def __init__(self, stream):
             self.stream = stream
+        # The atexit hook closes f before the interpreter's final stdout flush,
+        # so skip the file once closed (otherwise exit code 120 on every run).
         def write(self, s):
             try:
                 self.stream.write(s)
             finally:
-                f.write(s)
+                if not f.closed:
+                    f.write(s)
         def flush(self):
             try:
                 self.stream.flush()
             finally:
-                f.flush()
+                if not f.closed:
+                    f.flush()
 
     sys.stdout = _Tee(sys.stdout)
     sys.stderr = _Tee(sys.stderr)

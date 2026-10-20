@@ -1,0 +1,18 @@
+# Downloaders: Instagram breaks these often, deploys always upgrade them to latest
+yt-dlp
+gallery-dl
+
+selenium
+webdriver-manager
+requests
+beautifulsoup4
+lxml
+tqdm
+pytz
+dateparser
+emoji
+chardet
+python-dateutil
+
+# Optional: Pushbullet notifications (PUSHBULLET_TOKEN in config.txt)
+pushbullet.py

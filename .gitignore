@@ -47,3 +47,13 @@ downloads/
 *.png
 *.gif
 *.webp
+
+# Presets are per-machine (created in the menu); deploys must not overwrite them
+presets.json
+
+# Runtime state (job/cooldown, download lock, menu progress cache, deploy info)
+.run_state.json
+.run.lock
+.progress_cache.json
+.deployed_rev
+predeploy-backup-*/

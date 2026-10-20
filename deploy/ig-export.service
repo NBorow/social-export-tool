@@ -1,0 +1,25 @@
+# Template: deploy/setup-vm.sh fills in @APP_DIR@ and @USER@ and installs it.
+[Unit]
+Description=Instagram export background job (resumes the current preset)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@APP_DIR@
+ExecStart=@APP_DIR@/venv/bin/python -u social_export_tool.py --resume
+StandardInput=null
+# SIGTERM only the main process so an in-flight yt-dlp/gallery-dl download can
+# finish (each has a 300s timeout); everything is killed if it takes longer.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=660
+# Crashes and "lock busy" (exit 75) retry in 5 min. Exit 3 = needs a human
+# (checkpoint/login): stay stopped until `sudo systemctl restart ig-export`.
+Restart=on-failure
+RestartSec=300
+RestartPreventExitStatus=3
+
+[Install]
+WantedBy=multi-user.target

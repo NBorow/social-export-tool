@@ -18,10 +18,12 @@ A menu-driven tool for managing Instagram data exports (“profile dumps”) and
   - Driver is otherwise handled automatically by `webdriver-manager`
 - **Xvfb** (Linux only, required for profile scraping on headless servers): `sudo apt install xvfb`
   - The tool starts Xvfb automatically when needed — no manual setup required
-- Python packages:
+- Python packages (see `requirements.txt`):
   ```sh
-  pip install requests beautifulsoup4 lxml tqdm pytz dateparser emoji chardet python-dateutil selenium webdriver-manager yt-dlp gallery-dl
+  pip install -r requirements.txt
   ```
+  Instagram breaks the downloaders often. Before a big run after time away, update them:
+  `pip install -U yt-dlp gallery-dl` (the auto-deploy does this on every deploy).
 - Optional but recommended: **ffmpeg** on PATH (for media merges)
 
 The app checks for ffmpeg at startup and strongly recommends installing it. Without ffmpeg, some downloads may skip merging/transcoding and can fail depending on format.
@@ -32,7 +34,8 @@ git clone https://github.com/NBorow/social-export-tool.git
 # Repo name uses hyphen, Python entry script uses underscore
 cd social-export-tool 
 
-# If you keep a requirements.txt, use it; otherwise install packages from the command above.
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
 ```
 
 ## Configuration
@@ -59,6 +62,15 @@ AUTO_RETRY_ON_RATE_LIMIT=true
 # When enabled, detects text messages sent <1s after sharing posts in DMs
 # and offers to append them as filename suffixes (e.g., CrAb1234_cute_message.mp4)
 ASK_FOR_SEND_MESSAGE_APPEND=false
+
+# Block breaker: pause downloads after this many failures in a row with no success
+# (a "silent" block that doesn't return HTTP 429). 0 disables. Default 10.
+BLOCK_BREAKER_THRESHOLD=10
+# How long the breaker pauses, in hours. Persisted, so restarts honor it. Default 8.
+BLOCK_COOLDOWN_HOURS=8
+
+# Optional: Pushbullet notifications (blocks, checkpoints, finished jobs)
+# PUSHBULLET_TOKEN=your_token
 
 # Prepend post publish date to filenames (off by default)
 # Resulting pattern:
@@ -111,6 +123,75 @@ python social_export_tool.py
 - Use the options menu (e.g., **DM Download**) when available.  
 - Navigation: number to select, `n`/`p` to page, `c` for Settings, `q` to quit.
 
+### Progress in the menus
+Every menu shows how much of each part of a dump is already downloaded:
+
+```
+ 1. instagram-nick-2026-10-01          [ lrsd]  29,953/31,808  95%  · 1,855 left (1,855 failed before)
+...
+1. Liked Posts Download     1,946/3,119  62%  · 1,173 left (1,173 failed before)
+2. DM Download              23,457/24,046  97%  · 589 left (589 failed before)
+...
+1. gorionchat               2,341/2,400  97%  · 47 left (40 failed before) · 12 dead
+```
+
+- **Done** means downloaded under any source (the tool skips a liked post you already got from a DM).
+- **Dead** posts (marked probably deleted) are shown separately and don't count against the percentage.
+- **Failed before** posts get retried automatically the next time you run that download.
+- The first time a dump is shown, its post lists are indexed and cached in `.progress_cache.json`, so later menus open instantly.
+- **`v` (in a dump's options menu)** checks that every downloaded post's file is still on disk. It finds files the database has an outdated path for (e.g. a library copied from Windows), and can mark truly missing ones to re-download on the next run.
+
+## Unattended runs and background service
+Any queue preset can run with no prompts:
+
+```sh
+venv/bin/python social_export_tool.py --preset TESTOH   # run a preset now; remembered as the current job
+venv/bin/python social_export_tool.py --queue TESTOH    # make it the current job without running it (the service runs it)
+venv/bin/python social_export_tool.py --resume          # continue the current job if unfinished
+venv/bin/python social_export_tool.py --status          # job, block cooldown, who holds the download lock, deployed version
+venv/bin/python social_export_tool.py --stop-job        # forget the job so the service stops resuming it
+```
+
+- Resuming is cheap: posts already downloaded are skipped without touching Instagram, and the hourly/daily caps are computed from the database, so they survive restarts.
+- Rate limits retry automatically. A checkpoint or "login required" pauses the job, sends a Pushbullet alert, and exits with code 3. Fix it, then `sudo systemctl restart ig-export` to continue.
+- Only one process downloads at a time (`.run.lock`). You can open the menu and watch progress while the service runs, but starting a download there is refused until you `sudo systemctl stop ig-export`.
+
+### One-time VM setup
+1. **Install the service** (after the code is in the app folder, e.g. after the first deploy):
+   ```sh
+   sudo ~/NCinstagramdl/deploy/setup-vm.sh /home/nick/NCinstagramdl nick
+   ```
+   This installs `ig-export.service` (enabled at boot) and a sudoers rule that lets `nick` run only `systemctl restart ig-export` without a password.
+2. **Start a job in the background:**
+   ```sh
+   cd ~/NCinstagramdl
+   venv/bin/python social_export_tool.py --queue TESTOH
+   sudo systemctl start ig-export
+   ```
+   The service resumes that job from then on, including after reboots and deploys, until it finishes or you `--stop-job`. (To watch it live in tmux instead, use `--preset TESTOH`.)
+3. **Watch it:** `journalctl -u ig-export -f`, or `--status`. Run logs still go to `LOG_DIRECTORY`.
+
+### Auto-deploy on push to main
+`.github/workflows/deploy.yml` runs on a self-hosted runner on the VM (label `ig-export`) for every push to `main` (README-only changes are skipped). `deploy/deploy.sh`:
+1. Refuses code that doesn't compile (the live copy stays as it was).
+2. On the very first deploy, backs up the hand-copied files it replaces to `predeploy-backup-<timestamp>/`.
+3. Copies the tracked files into the app folder. `config.txt`, `presets.json`, cookies, the database and run state are untracked, so they're never touched.
+4. Installs `requirements.txt` and upgrades yt-dlp/gallery-dl.
+5. If the service is running, restarts it gracefully: the current post finishes, then the job resumes on the new code. Block cooldowns carry over.
+
+Register the runner (once). Runners are per repository, so this is separate from your other bots' runners:
+1. GitHub: repo **Settings → Actions → Runners → New self-hosted runner** (Linux x64). Copy the download commands and the token.
+2. On the VM, as `nick`:
+   ```sh
+   mkdir ~/actions-runner-igexport && cd ~/actions-runner-igexport
+   # paste the download + extract commands from GitHub, then:
+   ./config.sh --url https://github.com/NBorow/social-export-tool --token <TOKEN> --labels ig-export --name nick-vm-igexport
+   sudo ./svc.sh install nick && sudo ./svc.sh start
+   ```
+3. If the app folder isn't `/home/nick/NCinstagramdl`, set a repository variable `APP_DIR`.
+
+You can also deploy by hand from any checkout: `bash deploy/deploy.sh /path/to/checkout ~/NCinstagramdl`.
+
 ## What Gets Downloaded
 - **DM Download**: downloads shared posts in selected conversations. Profile shares can optionally trigger full profile grabs (depending on options shown in-app).
 - **Saved Posts Download**: downloads posts from your saved collections and unsorted saved posts, organized into per-collection folders under `downloads/saved/<CollectionName>/` with unsorted posts going to `downloads/saved/_unsorted/`
@@ -151,6 +232,8 @@ Use these logs to resume work, inspect errors, or post-process (e.g., build sort
 
 
 ### Blocking & Recovery
+- **Silent blocks** (every download fails with a generic error and no 429): the **block breaker** pauses all downloads for `BLOCK_COOLDOWN_HOURS` after `BLOCK_BREAKER_THRESHOLD` failures in a row with no success, and sends a Pushbullet alert. After a pause it trips again after only 3 failures until something succeeds. Interactive runs can press Enter to skip the pause.
+
 - **RateLimitError** (429 / "Please wait a few minutes" / temporary block):
 If AUTO_RETRY_ON_RATE_LIMIT=true, the app automatically retries the same item using an exponential schedule with ±15% jitter (e.g., ~75s → ~150s → ~300s → …, capped). Jitter avoids synchronized retry bursts. If set to false, you'll get an interactive prompt (retry / delayed retry / skip / quit).
 
